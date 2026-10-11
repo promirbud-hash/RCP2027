@@ -13,6 +13,9 @@ __pycache__/
 .ruff_cache/
 .pio/
 .vscode/
+desktop/build/
+desktop/dist/
+desktop/*.spec
 
 # Device-generated data and private settings must stay off the repository.
 /config.json

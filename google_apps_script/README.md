@@ -25,6 +25,13 @@ Terminal online może również dopisywać nowych pracowników przez chronioną
 tokenem operację `registerEmployee`. Skrypt sprawdza unikalność ID pracownika
 i UID karty pod blokadą przed zapisem do arkusza.
 
+Operacje `attendance` i `punch` są idempotentne względem `event_id`. Ponowienie
+żądania z tym samym ID zwraca istniejące zdarzenie, zamiast dopisać drugi wiersz
+lub przełączyć wejście na wyjście. Operacja `eventStatus` pozwala sprawdzić, czy
+zdarzenie o podanym ID znajduje się już w arkuszu. Po timeoutcie terminal
+pokazuje wynik jako nieznany, zapisuje ID w NVS i automatycznie pyta API o
+wynik; do jego rozstrzygnięcia nie przyjmuje kolejnego odbicia.
+
 Edytor arkuszy wykrywa zmiany wykonane przez API lub bezpośrednio w arkuszu.
 Jeśli od pobrania danych ktoś dopisał albo zmienił rekord, zapis pełnej tabeli
 zostanie odrzucony i trzeba odświeżyć dane przed ponowną edycją. Nadal zalecane
@@ -39,3 +46,8 @@ z powrotem przez API, aby bufor został odbudowany.
 Token i hasło Wi-Fi są zapisane jawnie na karcie SD, więc karta i kopie
 konfiguracji zawierają sekrety. Ogranicz dostęp do nich, nie wysyłaj ich w
 zgłoszeniach i unieważnij token po utracie karty.
+
+Żądania firmware'u wykonuje osobne zadanie sieciowe; odbicia i logi trafiają do
+kolejki, a zadanie sieciowe nie korzysta ze współdzielonej magistrali SPI
+ekranu i karty SD. Operacje API w aplikacji desktopowej wykonują się w wątku
+`QThread`, a wynik jest przekazywany do GUI sygnałami Qt.

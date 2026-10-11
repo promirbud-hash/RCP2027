@@ -11,11 +11,16 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <esp_camera.h>
+#include <esp_heap_caps.h>
 #include <esp_timer.h>
 #include <driver/gpio.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
 #include <Wire.h>
 #include <cstring>
 #include <cmath>
+#include <new>
 
 #include <vector>
 
@@ -30,13 +35,22 @@ constexpr uint32_t kRfidDebounceMs = 1400;
 constexpr uint32_t kClockRefreshMs = 1000;
 constexpr uint32_t kAttendanceConfirmationMs = 3000;
 constexpr uint32_t kHttpTimeoutMs = 8000;
+constexpr uint32_t kNetworkQueueWaitMs = 100;
 constexpr uint32_t kEmployeeRefreshMs = 300000;
 constexpr uint8_t kMaximumEmployees = 180;
 constexpr char kConfigPath[] = "/config.json";
 constexpr char kEmployeesPath[] = "/employees.csv";
 constexpr char kAttendancePath[] = "/attendance.csv";
+constexpr char kPendingAttendancePath[] = "/attendance_pending.csv";
+constexpr char kAttendanceHeader[] =
+    "event_id,timestamp,employee_id,card_uid,event_type,photo_file,source,notes";
 constexpr char kLogsPath[] = "/logs.csv";
-constexpr uint32_t kTouchCalibrationMagic = 0x52435054;
+constexpr char kWallpaperPath[] = "/WALLPAPER.RGB565";
+constexpr size_t kWallpaperPixelCount =
+    static_cast<size_t>(kScreenWidth) * kScreenHeight;
+constexpr size_t kWallpaperByteCount = kWallpaperPixelCount * sizeof(uint16_t);
+constexpr uint32_t kTouchCalibrationMagic = 0x52435055;
+constexpr uint32_t kLegacyTouchCalibrationMagic = 0x52435054;
 constexpr int kTouchCalibrationMargin = 30;
 
 class LGFX_RCP : public lgfx::LGFX_Device {
@@ -87,10 +101,20 @@ public:
 
 enum class Language : uint8_t { Polish, English, Spanish, German };
 enum class Mode : uint8_t { Offline, Online };
-enum class UiFont : uint8_t { Unicode, FreeSans, FreeSerif, FreeMono };
+enum class UiFont : uint8_t {
+    Unicode,
+    FreeSans,
+    FreeSerif,
+    FreeMono,
+    FreeSansBold,
+    FreeSerifBold,
+    FreeMonoBold
+};
+constexpr uint8_t kUiFontCount = 7;
 enum class Screen : uint8_t {
     Home,
     UnknownCard,
+    AttendanceStateCheck,
     ActionChoice,
     PinEntry,
     EmployeeEnroll,
@@ -100,9 +124,17 @@ enum class Screen : uint8_t {
     ClockSet,
     EmployeeList,
     AddEmployeeCard,
-    AttendanceConfirmation
+    AttendanceConfirmation,
+    WifiSetup,
+    WifiPassword
 };
 enum class AttendanceAction : uint8_t { Entry, Exit, Door };
+
+struct WifiNetwork {
+    String ssid;
+    int32_t rssi;
+    bool open;
+};
 
 struct Employee {
     String id;
@@ -111,6 +143,24 @@ struct Employee {
     String lastName;
     bool active = true;
     bool relayAccess = false;
+};
+
+struct AttendanceState {
+    String employeeId;
+    String eventType;
+};
+
+struct NetworkJob {
+    uint32_t requestId;
+    String body;
+    bool responseExpected;
+};
+
+struct NetworkResult {
+    uint32_t requestId;
+    bool success;
+    bool responseReceived;
+    String body;
 };
 
 struct Config {
@@ -140,10 +190,37 @@ MFRC522 rfid(pins::rfid_cs, pins::rfid_rst);
 RTC_DS3231 rtc;
 Preferences preferences;
 UiFont uiFont = UiFont::Unicode;
+bool displayInverted = false;
+uint16_t* wallpaperPixels = nullptr;
+bool wallpaperEnabled = true;
+constexpr size_t kVisibleSettings = 4;
+constexpr size_t kTotalSettings = 11;
+constexpr int kSettingsRowY = 45;
+constexpr int kSettingsRowHeight = 51;
+constexpr size_t kVisibleWifiNetworks = 4;
+constexpr int kWifiNetworkRowY = 68;
+constexpr int kWifiNetworkRowHeight = 49;
+
+float uiFontScale() {
+    switch (uiFont) {
+        case UiFont::Unicode: return 0.8f;
+        case UiFont::FreeSerif:
+        case UiFont::FreeSerifBold: return 0.31f;
+        case UiFont::FreeSansBold:
+        case UiFont::FreeMonoBold: return 0.33f;
+        case UiFont::FreeSans:
+        case UiFont::FreeMono:
+        default: return 0.35f;
+    }
+}
 
 void setUiTextSize(float size) {
-    const float fontScale = uiFont == UiFont::Unicode ? 0.8f : 0.35f;
+    const float fontScale = uiFontScale();
     display.setTextSize(size * fontScale);
+}
+
+float readableUiSize(float size) {
+    return size * 0.8f / uiFontScale();
 }
 
 void applyUiFont() {
@@ -157,6 +234,15 @@ void applyUiFont() {
         case UiFont::FreeMono:
             display.setFont(&lgfx::fonts::FreeMono12pt7b);
             break;
+        case UiFont::FreeSansBold:
+            display.setFont(&lgfx::fonts::FreeSansBold12pt7b);
+            break;
+        case UiFont::FreeSerifBold:
+            display.setFont(&lgfx::fonts::FreeSerifBold12pt7b);
+            break;
+        case UiFont::FreeMonoBold:
+            display.setFont(&lgfx::fonts::FreeMonoBold12pt7b);
+            break;
         case UiFont::Unicode:
         default:
             display.setFont(&lgfx::fonts::efontJA_10);
@@ -164,26 +250,139 @@ void applyUiFont() {
     }
 }
 
+void drawFittedText(const String& value, int16_t x, int16_t y,
+                    int16_t width, int16_t height, float baseSize,
+                    lgfx::textdatum_t datum) {
+    setUiTextSize(baseSize);
+    const int32_t availableWidth = max<int32_t>(1, width - 8);
+    const int32_t availableHeight = max<int32_t>(1, height - 6);
+    const int32_t measuredWidth = display.textWidth(value);
+    const int32_t measuredHeight = display.fontHeight();
+    float fitScale = 1.0f;
+    if (measuredWidth > availableWidth && measuredWidth > 0) {
+        fitScale = min(fitScale,
+                       static_cast<float>(availableWidth) / measuredWidth);
+    }
+    if (measuredHeight > availableHeight && measuredHeight > 0) {
+        fitScale = min(fitScale,
+                       static_cast<float>(availableHeight) / measuredHeight);
+    }
+    if (fitScale < 1.0f) setUiTextSize(baseSize * fitScale);
+
+    int16_t anchorX = x;
+    int16_t anchorY = y;
+    if (datum == lgfx::textdatum_t::middle_center) {
+        anchorX += width / 2;
+        anchorY += height / 2;
+    } else if (datum == lgfx::textdatum_t::middle_left) {
+        anchorY += height / 2;
+    } else if (datum == lgfx::textdatum_t::top_center) {
+        anchorX += width / 2;
+    }
+    display.setTextDatum(datum);
+    display.drawString(value, anchorX, anchorY);
+    display.setTextDatum(lgfx::textdatum_t::top_left);
+}
+
 void drawVerticalScrollbar(int16_t x, int16_t y, int16_t height,
                            size_t totalItems, size_t visibleItems, size_t offset) {
-    constexpr int16_t kScrollbarWidth = 18;
+    constexpr int16_t kScrollbarWidth = 24;
+    constexpr int16_t kArrowHeight = 18;
     const int16_t radius = kScrollbarWidth / 2;
     display.fillRoundRect(x, y, kScrollbarWidth, height, radius,
                           display.color565(39, 54, 82));
     if (totalItems <= visibleItems) return;
+    const uint16_t arrowColor = display.color565(232, 240, 255);
+    const int16_t centerX = x + kScrollbarWidth / 2;
+    display.fillTriangle(centerX, y + 4, x + 5, y + kArrowHeight - 2,
+                         x + kScrollbarWidth - 5, y + kArrowHeight - 2,
+                         arrowColor);
+    display.fillTriangle(centerX, y + height - 4,
+                         x + 5, y + height - kArrowHeight + 2,
+                         x + kScrollbarWidth - 5, y + height - kArrowHeight + 2,
+                         arrowColor);
+    const int16_t trackY = y + kArrowHeight;
+    const int16_t trackHeight = height - 2 * kArrowHeight;
     const int16_t thumbHeight = max<int16_t>(
-        36, static_cast<int16_t>((static_cast<int32_t>(height) * visibleItems) /
+        24, static_cast<int16_t>((static_cast<int32_t>(trackHeight) * visibleItems) /
                                   totalItems));
     const size_t maxOffset = totalItems - visibleItems;
-    const int16_t thumbY = y + static_cast<int16_t>(
-        (static_cast<int32_t>(height - thumbHeight) * offset) / maxOffset);
-    display.fillRoundRect(x, thumbY, kScrollbarWidth, thumbHeight, radius,
+    const int16_t thumbY = trackY + static_cast<int16_t>(
+        (static_cast<int32_t>(trackHeight - thumbHeight) * offset) / maxOffset);
+    display.fillRoundRect(x + 3, thumbY, kScrollbarWidth - 6, thumbHeight, 7,
                           display.color565(129, 172, 255));
+}
+
+size_t scrollbarOffsetForTouch(int16_t touchY, int16_t y, int16_t height,
+                               size_t totalItems, size_t visibleItems,
+                               size_t currentOffset) {
+    if (totalItems <= visibleItems) return 0;
+    const size_t maxOffset = totalItems - visibleItems;
+    constexpr int16_t kArrowHeight = 18;
+    if (touchY < y + kArrowHeight) {
+        return currentOffset > 0 ? currentOffset - 1 : 0;
+    }
+    if (touchY >= y + height - kArrowHeight) {
+        return currentOffset < maxOffset ? currentOffset + 1 : maxOffset;
+    }
+    const int16_t trackHeight = height - 2 * kArrowHeight;
+    const int16_t trackPosition = touchY - y - kArrowHeight;
+    return min(static_cast<size_t>(
+                   (static_cast<uint32_t>(trackPosition) * maxOffset) /
+                   trackHeight),
+               maxOffset);
+}
+
+extern bool sdAvailable;
+
+bool loadWallpaper() {
+    if (!sdAvailable || !SD.exists(kWallpaperPath)) return false;
+    File file = SD.open(kWallpaperPath, FILE_READ);
+    if (!file) {
+        Serial.println("Could not open WALLPAPER.RGB565");
+        return false;
+    }
+    if (file.size() != kWallpaperByteCount) {
+        Serial.printf("Invalid WALLPAPER.RGB565 size: %lu bytes; expected %u\n",
+                      static_cast<unsigned long>(file.size()),
+                      static_cast<unsigned>(kWallpaperByteCount));
+        file.close();
+        return false;
+    }
+    uint16_t* pixels = static_cast<uint16_t*>(
+        heap_caps_malloc(kWallpaperByteCount, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (pixels == nullptr) {
+        Serial.println("Could not allocate PSRAM buffer for wallpaper");
+        file.close();
+        return false;
+    }
+    const size_t bytesRead =
+        file.read(reinterpret_cast<uint8_t*>(pixels), kWallpaperByteCount);
+    file.close();
+    if (bytesRead != kWallpaperByteCount) {
+        Serial.printf("Incomplete WALLPAPER.RGB565 read: %lu bytes\n",
+                      static_cast<unsigned long>(bytesRead));
+        heap_caps_free(pixels);
+        return false;
+    }
+    if (wallpaperPixels != nullptr) heap_caps_free(wallpaperPixels);
+    wallpaperPixels = pixels;
+    Serial.println("Loaded 480x320 RGB565 wallpaper from SD into PSRAM");
+    return true;
+}
+
+void drawScreenBackground() {
+    if (wallpaperEnabled && wallpaperPixels != nullptr) {
+        display.pushImage(0, 0, kScreenWidth, kScreenHeight, wallpaperPixels);
+    } else {
+        display.fillScreen(display.color565(10, 17, 33));
+    }
 }
 
 TouchCalibration touchCalibration;
 Config config;
 std::vector<Employee> employees;
+std::vector<AttendanceState> offlineAttendanceStates;
 Screen screen = Screen::Home;
 Employee selectedEmployee;
 String pinInput;
@@ -206,6 +405,7 @@ bool offlineEmployeesLoaded = false;
 bool onlineEmployeesLoaded = false;
 bool sdFilesInitialized = false;
 bool relayWasActive = false;
+bool networkWorkerReady = false;
 volatile bool relayAutoClosed = false;
 String pendingPin;
 String pendingEmployeeUid;
@@ -214,21 +414,68 @@ String newEmployeeFirstName;
 String newEmployeeLastName;
 String attendanceConfirmationTitle;
 String attendanceConfirmationName;
+String pendingOnlineEventId;
+String pendingOnlineEmployeeId;
+String pendingOnlineEmployeeName;
 bool attendanceConfirmationSuccess = false;
 bool employeeEnrollmentRequested = false;
 bool newEmployeeRelayAccess = false;
 bool enrollmentNumericKeyboard = false;
 bool enrollmentLowercase = false;
+bool wifiConnecting = false;
+bool wifiScanInProgress = false;
+bool wifiSetupRadioWasOn = false;
+bool wifiSetupActive = false;
+bool wifiPasswordLowercase = false;
+uint8_t wifiKeyboardPage = 0;
 uint8_t enrollmentField = 0;
 uint8_t enrollmentAccentIndex = 0;
 uint32_t screenSince = 0;
 uint32_t attendanceConfirmationUntil = 0;
+uint32_t wifiConnectionStartedAt = 0;
 uint32_t nextNetworkAttemptAt = 0;
 uint32_t nextEmployeeRefreshAt = 0;
 uint16_t employeeListPage = 0;
 uint8_t settingsScroll = 0;
+size_t wifiNetworkScroll = 0;
 bool employeeManagementReturnToList = false;
+String selectedWifiSsid;
+String wifiPasswordInput;
+String wifiStatusMessage;
+std::vector<WifiNetwork> wifiNetworks;
 esp_timer_handle_t relayTimer = nullptr;
+QueueHandle_t networkJobQueue = nullptr;
+QueueHandle_t networkLogQueue = nullptr;
+QueueHandle_t networkAsyncResultQueue = nullptr;
+TaskHandle_t networkTaskHandle = nullptr;
+uint32_t networkRequestCounter = 0;
+uint32_t employeeRefreshRequestId = 0;
+uint32_t attendanceStateRequestId = 0;
+uint32_t pendingAttendanceRequestId = 0;
+uint32_t pendingQueueUploadRequestId = 0;
+uint32_t pendingQueueUploadStartedAt = 0;
+uint32_t nextQueueUploadAttemptAt = 0;
+uint32_t pendingStatusRequestId = 0;
+uint32_t pendingEmployeeUpdateRequestId = 0;
+uint32_t pendingEmployeeRegistrationRequestId = 0;
+uint32_t pendingAttendanceRequestStartedAt = 0;
+uint32_t pendingStatusRequestStartedAt = 0;
+uint32_t employeeRefreshRequestStartedAt = 0;
+uint32_t attendanceStateRequestStartedAt = 0;
+uint32_t employeeUpdateRequestStartedAt = 0;
+uint32_t employeeRegistrationRequestStartedAt = 0;
+uint32_t nextPendingStatusAttemptAt = 0;
+bool pendingStatusCheckInFlight = false;
+bool selectedEmployeePresent = false;
+bool outageActionChoice = false;
+bool pendingQueueSyncFailed = false;
+String pendingQueueUploadEventId;
+bool pendingAttendanceAutomatic = false;
+bool pendingAttendanceApiRejected = false;
+String pendingAttendanceExpectedType;
+String pendingAttendanceRequestBody;
+Employee pendingEmployeeUpdate;
+Employee pendingEmployeeRegistration;
 constexpr char kGoogleRootCertificate[] =
     "-----BEGIN CERTIFICATE-----\n"
     "MIIFVzCCAz+gAwIBAgINAgPlk28xsBNJiGuiFzANBgkqhkiG9w0BAQwFADBHMQsw\n"
@@ -289,6 +536,12 @@ const char* uiFontLabel() {
             return "FreeSerif";
         case UiFont::FreeMono:
             return "FreeMono";
+        case UiFont::FreeSansBold:
+            return "FreeSans Bold";
+        case UiFont::FreeSerifBold:
+            return "FreeSerif Bold";
+        case UiFont::FreeMonoBold:
+            return "FreeMono Bold";
         case UiFont::Unicode:
         default:
             return "Unicode";
@@ -469,10 +722,15 @@ String csvEscape(const String& value) {
 }
 
 String currentTimestamp();
-String capturePhoto();
+String capturePhoto(const Employee& employee, const String& eventId);
 void drawHome();
+void drawActionChoice();
+void drawEmployeeList();
+void drawEmployeeEnrollment();
 void drawAttendanceConfirmation();
+void finishEmployeeRegistration(const Employee& employee);
 size_t activeEmployeeCount();
+bool loadOfflineAttendanceIndex();
 
 bool ensureCsvFile(const char* path, const char* header) {
     if (!sdAvailable) return false;
@@ -502,15 +760,10 @@ bool ensureCsvFile(const char* path, const char* header) {
     return true;
 }
 
-bool postToAppsScript(JsonDocument& request, JsonDocument* response = nullptr) {
-    if (config.mode != Mode::Online || WiFi.status() != WL_CONNECTED ||
-        config.appsScriptUrl.isEmpty() || config.apiToken.isEmpty()) {
-        return false;
-    }
-    request["token"] = config.apiToken;
-    String body;
-    serializeJson(request, body);
-
+bool performAppsScriptPost(const String& body, String& responseBody,
+                           bool& responseReceived) {
+    if (WiFi.status() != WL_CONNECTED || config.appsScriptUrl.isEmpty() ||
+        config.apiToken.isEmpty()) return false;
     WiFiClientSecure secureClient;
     secureClient.setCACert(kGoogleRootCertificate);
     HTTPClient http;
@@ -519,12 +772,13 @@ bool postToAppsScript(JsonDocument& request, JsonDocument* response = nullptr) {
     if (!http.begin(secureClient, config.appsScriptUrl)) return false;
     http.addHeader("Content-Type", "application/json");
     const int status = http.POST(body);
+    responseReceived = status > 0;
     if (status < 200 || status >= 300) {
         Serial.printf("Apps Script HTTP error: %d\n", status);
         http.end();
         return false;
     }
-    const String responseBody = http.getString();
+    responseBody = http.getString();
     http.end();
     JsonDocument parsed;
     if (deserializeJson(parsed, responseBody) != DeserializationError::Ok ||
@@ -532,7 +786,115 @@ bool postToAppsScript(JsonDocument& request, JsonDocument* response = nullptr) {
         Serial.println("Apps Script returned an invalid or unsuccessful response");
         return false;
     }
-    if (response != nullptr) *response = parsed;
+    return true;
+}
+
+void networkTask(void*) {
+    while (true) {
+        NetworkJob* job = nullptr;
+        if (xQueueReceive(networkJobQueue, &job, 0) != pdTRUE &&
+            xQueueReceive(networkLogQueue, &job, pdMS_TO_TICKS(100)) != pdTRUE) {
+            continue;
+        }
+        if (job == nullptr) {
+            continue;
+        }
+        String responseBody;
+        bool responseReceived = false;
+        const bool success =
+            performAppsScriptPost(job->body, responseBody, responseReceived);
+        if (job->responseExpected) {
+            NetworkResult* result = new (std::nothrow) NetworkResult{
+                job->requestId, success, responseReceived, responseBody
+            };
+            if (result == nullptr || networkAsyncResultQueue == nullptr ||
+                xQueueSend(networkAsyncResultQueue, &result, portMAX_DELAY) != pdTRUE) {
+                delete result;
+                Serial.printf("Could not return network result for request %lu\n",
+                              static_cast<unsigned long>(job->requestId));
+            }
+        } else if (!success) {
+            Serial.println("Queued Apps Script log upload failed");
+        }
+        delete job;
+    }
+}
+
+bool enqueueNetworkRequest(const String& body, bool responseExpected,
+                           uint32_t requestId) {
+    QueueHandle_t queue = responseExpected ? networkJobQueue : networkLogQueue;
+    if (queue == nullptr) {
+        Serial.println("Network request queue is unavailable");
+        return false;
+    }
+    NetworkJob* job = new (std::nothrow) NetworkJob{requestId, body, responseExpected};
+    if (job == nullptr) {
+        Serial.println("Could not allocate an Apps Script request");
+        return false;
+    }
+    if (xQueueSend(queue, &job, pdMS_TO_TICKS(kNetworkQueueWaitMs)) != pdTRUE) {
+        delete job;
+        Serial.println("Apps Script request queue is full");
+        return false;
+    }
+    return true;
+}
+
+uint32_t nextNetworkRequestId() {
+    ++networkRequestCounter;
+    if (networkRequestCounter == 0) ++networkRequestCounter;
+    return networkRequestCounter;
+}
+
+bool enqueueAppsScriptLog(JsonDocument& request) {
+    if (config.mode != Mode::Online || WiFi.status() != WL_CONNECTED ||
+        config.appsScriptUrl.isEmpty() || config.apiToken.isEmpty()) {
+        return false;
+    }
+    request["token"] = config.apiToken;
+    String body;
+    serializeJson(request, body);
+    return enqueueNetworkRequest(body, false, nextNetworkRequestId());
+}
+
+bool enqueueAsyncAppsScriptRequest(JsonDocument& request, uint32_t requestId,
+                                   String& serializedRequest) {
+    if (config.mode != Mode::Online || WiFi.status() != WL_CONNECTED ||
+        config.appsScriptUrl.isEmpty() || config.apiToken.isEmpty()) {
+        return false;
+    }
+    request["token"] = config.apiToken;
+    serializeJson(request, serializedRequest);
+    return enqueueNetworkRequest(serializedRequest, true, requestId);
+}
+
+bool initializeNetworkWorker() {
+    networkJobQueue = xQueueCreate(8, sizeof(NetworkJob*));
+    networkLogQueue = xQueueCreate(8, sizeof(NetworkJob*));
+    networkAsyncResultQueue = xQueueCreate(8, sizeof(NetworkResult*));
+    if (networkJobQueue == nullptr || networkLogQueue == nullptr ||
+        networkAsyncResultQueue == nullptr) {
+        Serial.println("Could not create Apps Script queues");
+        if (networkJobQueue != nullptr) vQueueDelete(networkJobQueue);
+        if (networkLogQueue != nullptr) vQueueDelete(networkLogQueue);
+        if (networkAsyncResultQueue != nullptr) vQueueDelete(networkAsyncResultQueue);
+        networkJobQueue = nullptr;
+        networkLogQueue = nullptr;
+        networkAsyncResultQueue = nullptr;
+        return false;
+    }
+    const BaseType_t taskCreated = xTaskCreatePinnedToCore(
+        networkTask, "rcp-network", 12288, nullptr, 1, &networkTaskHandle, 0);
+    if (taskCreated != pdPASS) {
+        Serial.println("Could not create the Apps Script network task");
+        vQueueDelete(networkJobQueue);
+        vQueueDelete(networkLogQueue);
+        vQueueDelete(networkAsyncResultQueue);
+        networkJobQueue = nullptr;
+        networkLogQueue = nullptr;
+        networkAsyncResultQueue = nullptr;
+        return false;
+    }
     return true;
 }
 
@@ -574,7 +936,7 @@ void addLog(const char* level, const char* code, const String& message) {
         row["level"] = level;
         row["code"] = code;
         row["message"] = message;
-        if (!postToAppsScript(request)) {
+        if (!enqueueAppsScriptLog(request)) {
             Serial.printf("Online log upload failed%s: %s\n",
                           localLogWritten ? "; retained on SD" : "", code);
         }
@@ -762,8 +1124,71 @@ bool loadEmployeesFromCsv() {
         employees.push_back(employee);
     }
     file.close();
+    if (!loadOfflineAttendanceIndex()) {
+        employees.clear();
+        Serial.println("Could not build the offline attendance index");
+        return false;
+    }
     offlineEmployeesLoaded = true;
     return true;
+}
+
+bool loadOfflineAttendanceIndex() {
+    offlineAttendanceStates.clear();
+    if (!sdAvailable) return false;
+    File file = SD.open(kAttendancePath, FILE_READ);
+    if (!file) return false;
+    String line;
+    if (!readCsvRecord(file, line)) {
+        file.close();
+        return false;
+    }
+    if (line.startsWith("\xEF\xBB\xBF")) line.remove(0, 3);
+    if (line != "event_id,timestamp,employee_id,card_uid,event_type,photo_file,source,notes") {
+        file.close();
+        return false;
+    }
+    while (readCsvRecord(file, line)) {
+        if (line.isEmpty()) continue;
+        const auto fields = parseCsvRow(line);
+        if (fields.size() != 8 || fields[0].isEmpty() || fields[2].isEmpty() ||
+            fields[3].isEmpty() ||
+            (fields[4] != "ENTRY" && fields[4] != "EXIT")) {
+            file.close();
+            offlineAttendanceStates.clear();
+            return false;
+        }
+        bool updated = false;
+        for (auto& state : offlineAttendanceStates) {
+            if (state.employeeId == fields[2]) {
+                state.eventType = fields[4];
+                updated = true;
+                break;
+            }
+        }
+        if (!updated) {
+            offlineAttendanceStates.push_back({fields[2], fields[4]});
+        }
+    }
+    file.close();
+    return true;
+}
+
+String lastOfflineAttendance(const String& employeeId) {
+    for (const auto& state : offlineAttendanceStates) {
+        if (state.employeeId == employeeId) return state.eventType;
+    }
+    return "";
+}
+
+void updateOfflineAttendance(const String& employeeId, const String& eventType) {
+    for (auto& state : offlineAttendanceStates) {
+        if (state.employeeId == employeeId) {
+            state.eventType = eventType;
+            return;
+        }
+    }
+    offlineAttendanceStates.push_back({employeeId, eventType});
 }
 
 bool persistEmployeesOffline(const std::vector<Employee>& rows) {
@@ -808,41 +1233,24 @@ bool persistEmployeesOffline(const std::vector<Employee>& rows) {
     return true;
 }
 
-bool updateEmployeeRecord(size_t index, bool active, bool relayAccess) {
-    if (index >= employees.size()) return false;
-    std::vector<Employee> updated = employees;
-    updated[index].active = active;
-    updated[index].relayAccess = relayAccess;
-
-    if (config.mode == Mode::Online) {
-        JsonDocument request;
-        request["action"] = "updateEmployee";
-        JsonObject row = request["row"].to<JsonObject>();
-        row["employee_id"] = updated[index].id;
-        row["card_uid"] = updated[index].uid;
-        row["active"] = active;
-        row["relay_access"] = relayAccess;
-        if (!postToAppsScript(request)) {
-            lastMessage = text("Błąd aktualizacji w arkuszu",
-                               "Could not update employee sheet",
-                               "No se pudo actualizar la hoja",
-                               "Mitarbeiterblatt konnte nicht aktualisiert werden");
-            return false;
+void applyEmployeeUpdate(const Employee& updated) {
+    bool found = false;
+    for (auto& employee : employees) {
+        if (employee.id == updated.id) {
+            employee.active = updated.active;
+            employee.relayAccess = updated.relayAccess;
+            found = true;
+            break;
         }
-    } else if (!sdAvailable || !offlineEmployeesLoaded ||
-               !persistEmployeesOffline(updated)) {
-        lastMessage = text("Nie można zapisać employees.csv",
-                           "Could not save employees.csv",
-                           "No se pudo guardar employees.csv",
-                           "employees.csv konnte nicht gespeichert werden");
-        return false;
     }
-
-    employees = std::move(updated);
-    addLog("INFO", active ? "EMPLOYEE_UPDATED" : "EMPLOYEE_REMOVED",
-           employees[index].id);
-    lastMessage = active
-                      ? (relayAccess
+    if (!found) {
+        Serial.println("Employee update completed for a record no longer in memory");
+        return;
+    }
+    addLog("INFO", updated.active ? "EMPLOYEE_UPDATED" : "EMPLOYEE_REMOVED",
+           updated.id);
+    lastMessage = updated.active
+                      ? (updated.relayAccess
                              ? text("Nadano dostęp do przekaźnika",
                                     "Relay access enabled",
                                     "Acceso al relé habilitado",
@@ -854,19 +1262,69 @@ bool updateEmployeeRecord(size_t index, bool active, bool relayAccess) {
                       : text("Pracownik usunięty",
                              "Employee removed", "Empleado eliminado",
                              "Mitarbeiter entfernt");
+    if (screen == Screen::EmployeeList) drawEmployeeList();
+    else if (screen == Screen::Home) drawHome();
+}
+
+bool updateEmployeeRecord(size_t index, bool active, bool relayAccess) {
+    if (index >= employees.size()) return false;
+    if (config.mode == Mode::Online) {
+        if (pendingEmployeeUpdateRequestId != 0) {
+            lastMessage = text("Trwa aktualizacja pracownika",
+                               "Employee update is still running",
+                               "La actualización sigue en curso",
+                               "Mitarbeiteraktualisierung läuft");
+            return false;
+        }
+        Employee updated = employees[index];
+        updated.active = active;
+        updated.relayAccess = relayAccess;
+        JsonDocument request;
+        request["action"] = "updateEmployee";
+        JsonObject row = request["row"].to<JsonObject>();
+        row["employee_id"] = updated.id;
+        row["card_uid"] = updated.uid;
+        row["active"] = active;
+        row["relay_access"] = relayAccess;
+        pendingEmployeeUpdateRequestId = nextNetworkRequestId();
+        employeeUpdateRequestStartedAt = millis();
+        String serializedRequest;
+        if (!enqueueAsyncAppsScriptRequest(request, pendingEmployeeUpdateRequestId,
+                                           serializedRequest)) {
+            pendingEmployeeUpdateRequestId = 0;
+            employeeUpdateRequestStartedAt = 0;
+            lastMessage = text("Nie można wysłać aktualizacji",
+                               "Could not queue employee update",
+                               "No se pudo enviar la actualización",
+                               "Aktualisierung konnte nicht gesendet werden");
+            return false;
+        }
+        pendingEmployeeUpdate = updated;
+        lastMessage = text("Aktualizacja pracownika...",
+                           "Updating employee...",
+                           "Actualizando empleado...",
+                           "Mitarbeiter wird aktualisiert...");
+        return true;
+    }
+    std::vector<Employee> updated = employees;
+    updated[index].active = active;
+    updated[index].relayAccess = relayAccess;
+    if (!sdAvailable || !offlineEmployeesLoaded || !persistEmployeesOffline(updated)) {
+        lastMessage = text("Nie można zapisać employees.csv",
+                           "Could not save employees.csv",
+                           "No se pudo guardar employees.csv",
+                           "employees.csv konnte nicht gespeichert werden");
+        return false;
+    }
+    employees = std::move(updated);
+    applyEmployeeUpdate(employees[index]);
     return true;
 }
 
-bool loadEmployeesFromOnlineSheet() {
-    employees.clear();
-    onlineEmployeesLoaded = false;
-    JsonDocument request;
-    request["action"] = "employees";
-    JsonDocument response;
-    if (!postToAppsScript(request, &response)) return false;
-    JsonArrayConst rows = response["rows"].as<JsonArrayConst>();
+bool parseOnlineEmployees(JsonArrayConst rows, std::vector<Employee>& parsedEmployees) {
+    parsedEmployees.clear();
     for (JsonObjectConst row : rows) {
-        if (employees.size() >= kMaximumEmployees) break;
+        if (parsedEmployees.size() >= kMaximumEmployees) break;
         Employee employee;
         employee.id = row["employee_id"] | "";
         employee.uid = row["card_uid"] | "";
@@ -880,24 +1338,75 @@ bool loadEmployeesFromOnlineSheet() {
         if ((active != "true" && active != "false" && active != "1" && active != "0") ||
             (relayAccess != "true" && relayAccess != "false" &&
              relayAccess != "1" && relayAccess != "0")) {
-            employees.clear();
+            parsedEmployees.clear();
             Serial.println("Online employee sheet contains an invalid boolean value");
             return false;
         }
         employee.active = active == "true" || active == "1";
         employee.relayAccess = relayAccess == "true" || relayAccess == "1";
         bool duplicate = employee.id.isEmpty() || employee.uid.isEmpty();
-        for (const auto& existing : employees) {
+        for (const auto& existing : parsedEmployees) {
             if (existing.id == employee.id || existing.uid == employee.uid) duplicate = true;
         }
         if (duplicate) {
-            employees.clear();
+            parsedEmployees.clear();
             Serial.println("Online employee sheet contains empty or duplicate identifiers");
             return false;
         }
-        employees.push_back(employee);
+        parsedEmployees.push_back(employee);
     }
-    onlineEmployeesLoaded = true;
+    return true;
+}
+
+bool queueOnlineEmployeeRefresh() {
+    if (employeeRefreshRequestId != 0 || config.mode != Mode::Online ||
+        WiFi.status() != WL_CONNECTED) {
+        return false;
+    }
+    JsonDocument request;
+    request["action"] = "employees";
+    employeeRefreshRequestId = nextNetworkRequestId();
+    employeeRefreshRequestStartedAt = millis();
+    String serializedRequest;
+    if (!enqueueAsyncAppsScriptRequest(request, employeeRefreshRequestId,
+                                       serializedRequest)) {
+        employeeRefreshRequestId = 0;
+        employeeRefreshRequestStartedAt = 0;
+        return false;
+    }
+    return true;
+}
+
+bool queueOnlineAttendanceState(const Employee& employee) {
+    if (attendanceStateRequestId != 0 || config.mode != Mode::Online ||
+        WiFi.status() != WL_CONNECTED) {
+        return false;
+    }
+    JsonDocument request;
+    request["action"] = "lastAttendance";
+    request["employee_id"] = employee.id;
+    attendanceStateRequestId = nextNetworkRequestId();
+    attendanceStateRequestStartedAt = millis();
+    String serializedRequest;
+    if (!enqueueAsyncAppsScriptRequest(request, attendanceStateRequestId,
+                                       serializedRequest)) {
+        attendanceStateRequestId = 0;
+        attendanceStateRequestStartedAt = 0;
+        return false;
+    }
+    screen = Screen::AttendanceStateCheck;
+    display.fillScreen(color(10, 17, 33));
+    display.setTextColor(color(246, 249, 255));
+    drawFittedText(employee.firstName + " " + employee.lastName,
+                   24, 70, 432, 48, 2.2f,
+                   lgfx::textdatum_t::middle_center);
+    display.setTextColor(color(174, 190, 215));
+    drawFittedText(text("Sprawdzanie statusu obecności...",
+                        "Checking attendance status...",
+                        "Comprobando estado de asistencia...",
+                        "Anwesenheitsstatus wird geprüft..."),
+                   24, 132, 432, 64, 1.8f,
+                   lgfx::textdatum_t::middle_center);
     return true;
 }
 
@@ -914,92 +1423,729 @@ String currentTimestamp() {
     return String(buffer);
 }
 
-bool previousAttendance(const String& employeeId, String& previous) {
-    previous = "";
-    if (config.mode == Mode::Online) {
-        JsonDocument request;
-        request["action"] = "lastAttendance";
-        request["employee_id"] = employeeId;
-        JsonDocument response;
-        if (!postToAppsScript(request, &response)) return false;
-        previous = response["last_event_type"] | "";
-        return true;
+bool appendAttendance(const Employee& employee, AttendanceAction action,
+                      const String& eventId, const String& photoPath,
+                      String& recordedType) {
+    recordedType = action == AttendanceAction::Entry ? "ENTRY" : "EXIT";
+    if (config.mode != Mode::Offline || !sdAvailable) return false;
+    File file = SD.open(kAttendancePath, FILE_APPEND);
+    if (!file) {
+        addLog("ERROR", "ATTENDANCE_WRITE_FAILED", "Nie można dopisać attendance.csv");
+        return false;
     }
-    if (!sdAvailable) return false;
-    File file = SD.open(kAttendancePath, FILE_READ);
-    if (!file) return true;
-    String line;
-    readCsvRecord(file, line);
-    while (readCsvRecord(file, line)) {
-        const auto fields = parseCsvRow(line);
-        if (fields.size() >= 5 && fields[2] == employeeId &&
-            (fields[4] == "ENTRY" || fields[4] == "EXIT")) {
-            previous = fields[4];
+    if (file.size() == 0) {
+        constexpr char header[] =
+            "event_id,timestamp,employee_id,card_uid,event_type,photo_file,source,notes";
+        const size_t headerBytes = file.println(header);
+        file.flush();
+        if (headerBytes != strlen(header) + 2 || file.getWriteError() != 0) {
+            file.close();
+            addLog("ERROR", "ATTENDANCE_WRITE_FAILED",
+                   "Niepełny zapis nagłówka attendance.csv");
+            return false;
         }
     }
+    const String csvRow =
+        csvEscape(eventId) + "," + csvEscape(currentTimestamp()) + "," +
+        csvEscape(employee.id) + "," + csvEscape(employee.uid) + "," +
+        csvEscape(recordedType) + "," + csvEscape(photoPath) + "," +
+        csvEscape("offline") + ",\"\"\n";
+    const size_t written = file.print(csvRow);
+    file.flush();
+    const bool writeOk = written == csvRow.length() && file.getWriteError() == 0;
     file.close();
+    if (!writeOk) {
+        addLog("ERROR", "ATTENDANCE_WRITE_FAILED",
+               "Niepełny zapis attendance.csv");
+        return false;
+    }
+    updateOfflineAttendance(employee.id, recordedType);
     return true;
 }
 
-bool appendAttendance(const Employee& employee, AttendanceAction action,
-                      const String& photoPath, bool automatic, String& recordedType) {
-    const String eventId = String(millis()) + "-" + String(esp_random(), HEX) +
-                           "-" + String(++eventCounter);
-    recordedType = action == AttendanceAction::Entry ? "ENTRY" : "EXIT";
-    if (config.mode == Mode::Online) {
-        JsonDocument request;
-        request["action"] = automatic ? "punch" : "attendance";
-        JsonObject row = request["row"].to<JsonObject>();
-        row["event_id"] = eventId;
-        row["timestamp"] = currentTimestamp();
-        row["employee_id"] = employee.id;
-        row["card_uid"] = employee.uid;
-        if (!automatic) row["event_type"] = recordedType;
-        row["photo_file"] = photoPath;
-        row["source"] = "online";
-        row["notes"] = "";
-        JsonDocument response;
-        if (!postToAppsScript(request, &response)) {
-            lastMessage = text("Błąd połączenia — brak zapisu", "Connection failed — not saved",
-                              "Error de conexión — no guardado",
-                              "Verbindung fehlgeschlagen — nicht gespeichert");
-            Serial.printf("Attendance API failed; event not stored locally: %s\n",
-                          employee.id.c_str());
-            return false;
+bool hasPendingOnlineAttendance() {
+    if (!sdAvailable || !SD.exists(kPendingAttendancePath)) return false;
+    File file = SD.open(kPendingAttendancePath, FILE_READ);
+    if (!file) return true;
+    String record;
+    const bool headerOk = readCsvRecord(file, record) &&
+                          record == kAttendanceHeader;
+    const bool hasRows = headerOk && readCsvRecord(file, record);
+    file.close();
+    return !headerOk || hasRows;
+}
+
+bool appendPendingOnlineAttendance(const Employee& employee,
+                                   AttendanceAction action,
+                                   const String& eventId,
+                                   const String& photoPath) {
+    if (!sdAvailable || config.mode != Mode::Online || !rtcAvailable) return false;
+    if (!ensureCsvFile(kPendingAttendancePath, kAttendanceHeader)) return false;
+    File check = SD.open(kPendingAttendancePath, FILE_READ);
+    String header;
+    const bool headerValid =
+        check && readCsvRecord(check, header) && header == kAttendanceHeader;
+    if (check) check.close();
+    if (!headerValid) {
+        Serial.println("Temporary online attendance queue header is invalid");
+        return false;
+    }
+    File file = SD.open(kPendingAttendancePath, FILE_APPEND);
+    if (!file) {
+        Serial.println("Could not open online attendance queue on SD");
+        return false;
+    }
+    String row = csvEscape(eventId) + "," + csvEscape(currentTimestamp()) + "," +
+                 csvEscape(employee.id) + "," + csvEscape(employee.uid) + "," +
+                 csvEscape(action == AttendanceAction::Entry ? "ENTRY" : "EXIT") +
+                 "," + csvEscape(photoPath) + "," + csvEscape("online-buffer") +
+                 ",\"\"\n";
+    const size_t written = file.print(row);
+    file.flush();
+    const bool writeOk = written == row.length() && file.getWriteError() == 0;
+    file.close();
+    if (!writeOk) {
+        Serial.println("Could not fully write online attendance queue record");
+        return false;
+    }
+    return true;
+}
+
+bool removePendingOnlineAttendance(const String& eventId) {
+    constexpr char temporaryPath[] = "/attendance_pending.csv.tmp";
+    constexpr char backupPath[] = "/attendance_pending.csv.bak";
+    if (!sdAvailable || !SD.exists(kPendingAttendancePath)) return false;
+    File source = SD.open(kPendingAttendancePath, FILE_READ);
+    if (!source) return false;
+    String record;
+    if (!readCsvRecord(source, record) || record != kAttendanceHeader) {
+        source.close();
+        Serial.println("Online attendance queue has an invalid header");
+        return false;
+    }
+    if (!readCsvRecord(source, record)) {
+        source.close();
+        Serial.println("Online attendance queue unexpectedly has no pending row");
+        return false;
+    }
+    const auto firstRow = parseCsvRow(record);
+    if (firstRow.size() != 8 || firstRow[0] != eventId) {
+        source.close();
+        Serial.println("Online attendance queue head does not match server acknowledgement");
+        return false;
+    }
+
+    SD.remove(temporaryPath);
+    SD.remove(backupPath);
+    File destination = SD.open(temporaryPath, FILE_WRITE);
+    if (!destination) {
+        source.close();
+        Serial.println("Could not create temporary online attendance queue");
+        return false;
+    }
+    bool writeOk = destination.println(kAttendanceHeader) > 0;
+    while (writeOk && readCsvRecord(source, record)) {
+        if (record.isEmpty()) continue;
+        writeOk = destination.println(record) > 0;
+    }
+    destination.flush();
+    writeOk = writeOk && destination.getWriteError() == 0;
+    destination.close();
+    source.close();
+    if (!writeOk) {
+        SD.remove(temporaryPath);
+        Serial.println("Could not rewrite online attendance queue");
+        return false;
+    }
+
+    if (!SD.rename(kPendingAttendancePath, backupPath)) {
+        SD.remove(temporaryPath);
+        Serial.println("Could not back up online attendance queue");
+        return false;
+    }
+    if (!SD.rename(temporaryPath, kPendingAttendancePath)) {
+        SD.rename(backupPath, kPendingAttendancePath);
+        SD.remove(temporaryPath);
+        Serial.println("Could not commit online attendance queue update");
+        return false;
+    }
+    SD.remove(backupPath);
+    return true;
+}
+
+void clearPendingOnlineAttendance() {
+    preferences.remove("pending_event");
+    preferences.remove("pend_emp");
+    preferences.remove("pending_name");
+    pendingOnlineEventId = "";
+    pendingOnlineEmployeeId = "";
+    pendingOnlineEmployeeName = "";
+    pendingAttendanceRequestId = 0;
+    pendingStatusRequestId = 0;
+    pendingAttendanceRequestStartedAt = 0;
+    pendingStatusRequestStartedAt = 0;
+    pendingStatusCheckInFlight = false;
+    pendingAttendanceAutomatic = false;
+    pendingAttendanceApiRejected = false;
+    pendingAttendanceExpectedType = "";
+    pendingAttendanceRequestBody = "";
+    preferences.remove("pending_payload");
+}
+
+void resolvePendingAttendance(const String& eventType) {
+    if (eventType != "ENTRY" && eventType != "EXIT") {
+        Serial.println("Attendance status returned an invalid event type");
+        return;
+    }
+    const String resolvedEmployeeId = pendingOnlineEmployeeId;
+    const String resolvedEmployeeName = pendingOnlineEmployeeName;
+    clearPendingOnlineAttendance();
+    attendanceConfirmationSuccess = true;
+    attendanceConfirmationTitle =
+        eventType == "ENTRY"
+            ? text("Dzień dobry", "Good morning", "Buenos días", "Guten Morgen")
+            : text("Do widzenia", "Goodbye", "Hasta luego", "Auf Wiedersehen");
+    attendanceConfirmationName = resolvedEmployeeName;
+    for (const auto& employee : employees) {
+        if (employee.id == resolvedEmployeeId) {
+            String employeeName = employee.firstName + " " + employee.lastName;
+            employeeName.trim();
+            if (!employeeName.isEmpty()) attendanceConfirmationName = employeeName;
+            break;
         }
-        if (automatic) {
-            recordedType = response["event_type"] | "";
-            if (recordedType != "ENTRY" && recordedType != "EXIT") {
-                lastMessage = text("Błędna odpowiedź API", "Invalid API response",
-                                   "Respuesta API inválida", "Ungültige API-Antwort");
-                return false;
-            }
-        }
+    }
+    lastMessage = "";
+    screen = Screen::AttendanceConfirmation;
+    screenSince = millis();
+    attendanceConfirmationUntil = screenSince + kAttendanceConfirmationMs;
+    drawAttendanceConfirmation();
+}
+
+void showAttendanceApiRejection() {
+    attendanceConfirmationSuccess = false;
+    attendanceConfirmationTitle =
+        text("Zdarzenie odrzucone przez API",
+             "Event rejected by API",
+             "Evento rechazado por API",
+             "Ereignis von API abgelehnt");
+    attendanceConfirmationName = "";
+    lastMessage = attendanceConfirmationTitle;
+    clearPendingOnlineAttendance();
+    screen = Screen::AttendanceConfirmation;
+    screenSince = millis();
+    attendanceConfirmationUntil = screenSince + kAttendanceConfirmationMs;
+    drawAttendanceConfirmation();
+}
+
+void schedulePendingAttendanceStatusCheck() {
+    if (pendingOnlineEventId.isEmpty() || pendingAttendanceRequestId != 0 ||
+        pendingStatusCheckInFlight || config.mode != Mode::Online ||
+        WiFi.status() != WL_CONNECTED ||
+        static_cast<int32_t>(millis() - nextPendingStatusAttemptAt) < 0) {
+        return;
+    }
+    JsonDocument request;
+    request["action"] = "eventStatus";
+    request["event_id"] = pendingOnlineEventId;
+    pendingStatusRequestId = nextNetworkRequestId();
+    pendingStatusRequestStartedAt = millis();
+    String serializedRequest;
+    if (enqueueAsyncAppsScriptRequest(request, pendingStatusRequestId,
+                                      serializedRequest)) {
+        pendingStatusCheckInFlight = true;
     } else {
-        if (!sdAvailable) return false;
-        File file = SD.open(kAttendancePath, FILE_APPEND);
-        if (!file) {
-            addLog("ERROR", "ATTENDANCE_WRITE_FAILED", "Nie można dopisać attendance.csv");
-            return false;
-        }
-        if (file.size() == 0) {
-            file.println("event_id,timestamp,employee_id,card_uid,event_type,photo_file,source,notes");
-        }
-        file.printf("%s,%s,%s,%s,%s,%s,%s,%s\n",
-                    csvEscape(eventId).c_str(), csvEscape(currentTimestamp()).c_str(),
-                    csvEscape(employee.id).c_str(), csvEscape(employee.uid).c_str(),
-                    csvEscape(recordedType).c_str(), csvEscape(photoPath).c_str(),
-                    csvEscape("offline").c_str(), csvEscape("").c_str());
+        pendingStatusRequestId = 0;
+        pendingStatusRequestStartedAt = 0;
+        nextPendingStatusAttemptAt = millis() + 10000;
+    }
+}
+
+bool startPendingOnlineAttendanceUpload() {
+    if (pendingQueueUploadRequestId != 0 || config.mode != Mode::Online ||
+        WiFi.status() != WL_CONNECTED || !sdAvailable ||
+        static_cast<int32_t>(millis() - nextQueueUploadAttemptAt) < 0) {
+        return false;
+    }
+    if (!SD.exists(kPendingAttendancePath)) return false;
+    File file = SD.open(kPendingAttendancePath, FILE_READ);
+    if (!file) {
+        Serial.println("Could not open online attendance queue for upload");
+        pendingQueueSyncFailed = true;
+        lastMessage = text("Błąd kolejki odbić na karcie SD",
+                           "SD attendance queue error",
+                           "Error en la cola de asistencia SD",
+                           "Fehler in der SD-Buchungswarteschlange");
+        if (screen == Screen::Home) drawHome();
+        nextQueueUploadAttemptAt = millis() + 10000;
+        return false;
+    }
+    String record;
+    if (!readCsvRecord(file, record) || record != kAttendanceHeader) {
         file.close();
+        Serial.println("Online attendance queue has an invalid header");
+        pendingQueueSyncFailed = true;
+        lastMessage = text("Błędny plik attendance_pending.csv",
+                           "Invalid attendance_pending.csv file",
+                           "Archivo attendance_pending.csv no válido",
+                           "Ungültige Datei attendance_pending.csv");
+        if (screen == Screen::Home) drawHome();
+        nextQueueUploadAttemptAt = millis() + 30000;
+        return false;
+    }
+    if (!readCsvRecord(file, record)) {
+        file.close();
+        return false;
+    }
+    file.close();
+    const auto fields = parseCsvRow(record);
+    if (fields.size() != 8 || fields[0].isEmpty() || fields[2].isEmpty() ||
+        fields[3].isEmpty() || (fields[4] != "ENTRY" && fields[4] != "EXIT")) {
+        Serial.println("Online attendance queue contains an invalid row");
+        pendingQueueSyncFailed = true;
+        lastMessage = text("Błędny wpis w kolejce odbić na SD",
+                           "Invalid row in SD attendance queue",
+                           "Registro no válido en la cola SD",
+                           "Ungültiger Eintrag in der SD-Warteschlange");
+        if (screen == Screen::Home) drawHome();
+        nextQueueUploadAttemptAt = millis() + 30000;
+        return false;
+    }
+
+    JsonDocument request;
+    request["action"] = "attendance";
+    JsonObject row = request["row"].to<JsonObject>();
+    row["event_id"] = fields[0];
+    row["timestamp"] = fields[1];
+    row["employee_id"] = fields[2];
+    row["card_uid"] = fields[3];
+    row["event_type"] = fields[4];
+    row["photo_file"] = fields[5];
+    row["source"] = fields[6];
+    row["notes"] = fields[7];
+    pendingQueueUploadEventId = fields[0];
+    pendingQueueUploadRequestId = nextNetworkRequestId();
+    pendingQueueUploadStartedAt = millis();
+    String serializedRequest;
+    if (!enqueueAsyncAppsScriptRequest(request, pendingQueueUploadRequestId,
+                                       serializedRequest)) {
+        pendingQueueUploadEventId = "";
+        pendingQueueUploadRequestId = 0;
+        pendingQueueUploadStartedAt = 0;
+        nextQueueUploadAttemptAt = millis() + 10000;
+        return false;
+    }
+    return true;
+}
+
+void handleAsyncNetworkResults() {
+    if (networkAsyncResultQueue == nullptr) return;
+    NetworkResult* result = nullptr;
+    while (xQueueReceive(networkAsyncResultQueue, &result, 0) == pdTRUE &&
+           result != nullptr) {
+        if (pendingQueueUploadRequestId != 0 &&
+            result->requestId == pendingQueueUploadRequestId) {
+            pendingQueueUploadRequestId = 0;
+            pendingQueueUploadStartedAt = 0;
+            if (result->success) {
+                JsonDocument response;
+                const bool acknowledged =
+                    deserializeJson(response, result->body) == DeserializationError::Ok &&
+                    String(response["event_id"] | "") == pendingQueueUploadEventId;
+                if (acknowledged &&
+                    removePendingOnlineAttendance(pendingQueueUploadEventId)) {
+                    pendingQueueUploadEventId = "";
+                    pendingQueueSyncFailed = false;
+                    nextQueueUploadAttemptAt = millis();
+                    if (!hasPendingOnlineAttendance()) {
+                        lastMessage = "";
+                        addLog("INFO", "ONLINE_ATTENDANCE_QUEUE_SYNCED",
+                               "Temporary attendance queue uploaded");
+                        if (screen == Screen::Home) drawHome();
+                    }
+                } else {
+                    Serial.println("Attendance queue upload acknowledgement was invalid");
+                    addLog("ERROR", "ONLINE_ATTENDANCE_QUEUE_ACK_FAILED",
+                           pendingQueueUploadEventId);
+                    pendingQueueUploadEventId = "";
+                    pendingQueueSyncFailed = true;
+                    lastMessage =
+                        text("Nie potwierdzono wysłania odbicia — kolejka zachowana",
+                             "Punch was not confirmed — queue retained",
+                             "No se confirmó el envío — cola conservada",
+                             "Buchung nicht bestätigt — Warteschlange bleibt");
+                    if (screen == Screen::Home) drawHome();
+                    nextQueueUploadAttemptAt = millis() + 10000;
+                }
+            } else {
+                Serial.println("Online attendance queue upload failed; retaining row");
+                pendingQueueUploadEventId = "";
+                pendingQueueSyncFailed = true;
+                lastMessage =
+                    text("Nie można wysłać odbić — sprawdź połączenie",
+                         "Could not sync punches — check connection",
+                         "No se pudieron enviar registros — revise conexión",
+                         "Buchungen nicht synchronisiert — Verbindung prüfen");
+                if (screen == Screen::Home) drawHome();
+                nextQueueUploadAttemptAt = millis() + 10000;
+            }
+        } else if (employeeRefreshRequestId != 0 &&
+            result->requestId == employeeRefreshRequestId) {
+            employeeRefreshRequestId = 0;
+            employeeRefreshRequestStartedAt = 0;
+            if (result->success) {
+                JsonDocument response;
+                std::vector<Employee> loaded;
+                if (deserializeJson(response, result->body) == DeserializationError::Ok &&
+                    response["rows"].is<JsonArrayConst>() &&
+                    parseOnlineEmployees(response["rows"].as<JsonArrayConst>(), loaded)) {
+                    employees = std::move(loaded);
+                    onlineEmployeesLoaded = true;
+                    if (pendingOnlineEventId.isEmpty()) lastMessage = "";
+                    if (screen == Screen::EmployeeList) drawEmployeeList();
+                    else if (screen == Screen::Home) drawHome();
+                } else {
+                    Serial.println("Online employee response is invalid");
+                    addLog("ERROR", "EMPLOYEE_SYNC_FAILED", "Invalid employee response");
+                }
+            } else {
+                Serial.println("Online employee refresh failed; retaining current list");
+                addLog("ERROR", "EMPLOYEE_SYNC_FAILED", "Request failed");
+            }
+        } else if (attendanceStateRequestId != 0 &&
+                   result->requestId == attendanceStateRequestId) {
+            attendanceStateRequestId = 0;
+            attendanceStateRequestStartedAt = 0;
+            String eventType;
+            bool validResponse = false;
+            if (result->success) {
+                JsonDocument response;
+                validResponse =
+                    deserializeJson(response, result->body) == DeserializationError::Ok &&
+                    (response["ok"] | false) &&
+                    response["last_event_type"].is<const char*>();
+                if (validResponse) {
+                    eventType = response["last_event_type"] | "";
+                    validResponse = eventType.isEmpty() ||
+                                    eventType == "ENTRY" || eventType == "EXIT";
+                }
+            }
+            if (validResponse) {
+                selectedEmployeePresent = eventType == "ENTRY";
+                screen = Screen::ActionChoice;
+                drawActionChoice();
+            } else {
+                Serial.println("Attendance state check failed; requesting manual punch type");
+                addLog("WARN", "ATTENDANCE_STATE_CHECK_FAILED",
+                       "Falling back to employee-confirmed entry or exit");
+                outageActionChoice = true;
+                screen = Screen::ActionChoice;
+                drawActionChoice();
+            }
+        } else if (pendingEmployeeUpdateRequestId != 0 &&
+                   result->requestId == pendingEmployeeUpdateRequestId) {
+            pendingEmployeeUpdateRequestId = 0;
+            employeeUpdateRequestStartedAt = 0;
+            if (result->success) {
+                applyEmployeeUpdate(pendingEmployeeUpdate);
+            } else {
+                lastMessage =
+                text("Wynik aktualizacji nieznany — odśwież listę",
+                     "Update result unknown — refresh the list",
+                     "Resultado desconocido — actualice la lista",
+                     "Ergebnis unbekannt — Liste aktualisieren");
+                if (screen == Screen::EmployeeList) drawEmployeeList();
+            }
+        } else if (pendingEmployeeRegistrationRequestId != 0 &&
+                   result->requestId == pendingEmployeeRegistrationRequestId) {
+            pendingEmployeeRegistrationRequestId = 0;
+            employeeRegistrationRequestStartedAt = 0;
+            if (result->success) {
+                finishEmployeeRegistration(pendingEmployeeRegistration);
+            } else {
+                String apiError;
+                if (result->responseReceived) {
+                    JsonDocument response;
+                    if (deserializeJson(response, result->body) == DeserializationError::Ok) {
+                        apiError = response["error"] | "";
+                    }
+                }
+                if (apiError == "card_uid_already_exists") {
+                    lastMessage = text("Ta karta jest już przypisana w arkuszu Google",
+                                       "This card is already assigned in Google Sheets",
+                                       "La tarjeta ya está asignada en Google Sheets",
+                                       "Diese Karte ist bereits in Google Sheets zugeordnet");
+                } else if (apiError == "employee_id_already_exists") {
+                    lastMessage = text("To ID jest już używane w arkuszu Google",
+                                       "This ID is already used in Google Sheets",
+                                       "Este ID ya se usa en Google Sheets",
+                                       "Diese ID wird bereits in Google Sheets verwendet");
+                } else {
+                    lastMessage =
+                        text("Nie można dodać pracownika — sprawdź arkusz i połączenie",
+                             "Could not add employee — check the sheet and connection",
+                             "No se pudo añadir — revise la hoja y la conexión",
+                             "Mitarbeiter konnte nicht hinzugefügt werden — "
+                             "Tabelle und Verbindung prüfen");
+                    if (!apiError.isEmpty()) {
+                        Serial.printf("Employee registration rejected by API: %s\n",
+                                      apiError.c_str());
+                    } else {
+                        Serial.println("Employee registration result was not successful");
+                    }
+                }
+                pendingEmployeeRegistration = Employee{};
+                if (screen == Screen::EmployeeEnroll) drawEmployeeEnrollment();
+                if (screen == Screen::EmployeeEnroll) drawEmployeeEnrollment();
+            }
+        } else if (pendingAttendanceRequestId != 0 &&
+                   result->requestId == pendingAttendanceRequestId) {
+            pendingAttendanceRequestId = 0;
+            pendingAttendanceRequestStartedAt = 0;
+            if (result->success) {
+                JsonDocument response;
+                const bool parsed =
+                    deserializeJson(response, result->body) == DeserializationError::Ok;
+                if (parsed &&
+                    String(response["event_id"] | "") == pendingOnlineEventId) {
+                    String eventType = pendingAttendanceExpectedType;
+                    if (response["event_type"].is<const char*>()) {
+                        eventType = response["event_type"] | "";
+                    }
+                    if (eventType == "ENTRY" || eventType == "EXIT") {
+                        if (!pendingAttendanceAutomatic &&
+                            eventType != pendingAttendanceExpectedType) {
+                            nextPendingStatusAttemptAt = millis();
+                        } else {
+                            resolvePendingAttendance(eventType);
+                        }
+                    } else {
+                        nextPendingStatusAttemptAt = millis();
+                    }
+                } else {
+                    nextPendingStatusAttemptAt = millis();
+                }
+            } else {
+                JsonDocument errorResponse;
+                if (result->responseReceived &&
+                    deserializeJson(errorResponse, result->body) == DeserializationError::Ok &&
+                    errorResponse["ok"].is<bool>() &&
+                    !(errorResponse["ok"] | true)) {
+                    pendingAttendanceApiRejected = true;
+                }
+                nextPendingStatusAttemptAt = millis();
+            }
+        } else if (pendingStatusRequestId != 0 &&
+                   result->requestId == pendingStatusRequestId) {
+            pendingStatusRequestId = 0;
+            pendingStatusRequestStartedAt = 0;
+            pendingStatusCheckInFlight = false;
+            if (result->success) {
+                JsonDocument response;
+                const bool parsed =
+                    deserializeJson(response, result->body) == DeserializationError::Ok;
+                if (parsed && response["found"].is<bool>()) {
+                    if (response["found"] | false) {
+                        resolvePendingAttendance(response["event_type"] | "");
+                    } else if (pendingAttendanceApiRejected) {
+                        showAttendanceApiRejection();
+                    } else if (!pendingAttendanceRequestBody.isEmpty()) {
+                        const uint32_t retryId = nextNetworkRequestId();
+                        JsonDocument retryRequest;
+                        String serializedRequest;
+                        if (deserializeJson(retryRequest, pendingAttendanceRequestBody) ==
+                                DeserializationError::Ok &&
+                            enqueueAsyncAppsScriptRequest(retryRequest, retryId,
+                                                          serializedRequest)) {
+                            pendingAttendanceRequestId = retryId;
+                        } else {
+                            nextPendingStatusAttemptAt = millis() + 10000;
+                        }
+                    } else {
+                        nextPendingStatusAttemptAt = millis() + 10000;
+                    }
+                } else {
+                    nextPendingStatusAttemptAt = millis() + 10000;
+                }
+            } else {
+                nextPendingStatusAttemptAt = millis() + 10000;
+            }
+        } else {
+            Serial.printf("Discarding unhandled network result %lu\n",
+                          static_cast<unsigned long>(result->requestId));
+        }
+        delete result;
+        result = nullptr;
+    }
+    schedulePendingAttendanceStatusCheck();
+    startPendingOnlineAttendanceUpload();
+}
+
+bool queueOnlineAttendance(const Employee& employee, AttendanceAction action,
+                           const String& eventId, const String& photoPath,
+                           bool automatic) {
+    pendingAttendanceApiRejected = false;
+    pendingAttendanceAutomatic = automatic;
+    pendingAttendanceExpectedType =
+        action == AttendanceAction::Entry ? "ENTRY" : "EXIT";
+    JsonDocument request;
+    request["action"] = automatic ? "punch" : "attendance";
+    JsonObject row = request["row"].to<JsonObject>();
+    row["event_id"] = eventId;
+    row["timestamp"] = currentTimestamp();
+    row["employee_id"] = employee.id;
+    row["card_uid"] = employee.uid;
+    if (!automatic) row["event_type"] = pendingAttendanceExpectedType;
+    row["photo_file"] = photoPath;
+    row["source"] = "online";
+    row["notes"] = "";
+    String employeeName = employee.firstName + " " + employee.lastName;
+    employeeName.trim();
+    if (employeeName.isEmpty()) employeeName = employee.id;
+    serializeJson(request, pendingAttendanceRequestBody);
+    if (preferences.putString("pend_emp", employee.id) == 0 ||
+        preferences.putString("pending_payload", pendingAttendanceRequestBody) == 0 ||
+        preferences.putString("pending_name", employeeName) == 0 ||
+        preferences.putString("pending_event", eventId) == 0) {
+        preferences.remove("pending_event");
+        preferences.remove("pend_emp");
+        preferences.remove("pending_payload");
+        preferences.remove("pending_name");
+        pendingAttendanceRequestBody = "";
+        lastMessage = text("Nie można zabezpieczyć ID zdarzenia",
+                           "Could not persist event ID",
+                           "No se pudo guardar el ID del evento",
+                           "Ereignis-ID konnte nicht gesichert werden");
+        return false;
+    }
+    pendingOnlineEventId = eventId;
+    pendingOnlineEmployeeId = employee.id;
+    pendingOnlineEmployeeName = employeeName;
+    pendingAttendanceRequestId = nextNetworkRequestId();
+    pendingAttendanceRequestStartedAt = millis();
+    String serializedRequest;
+    if (!enqueueAsyncAppsScriptRequest(request, pendingAttendanceRequestId,
+                                       serializedRequest)) {
+        clearPendingOnlineAttendance();
+        return false;
     }
     return true;
 }
 
 void processAttendance(AttendanceAction action, bool automatic = false) {
     lastMessage = "";
-    const String photo = capturePhoto();
+    if (config.mode == Mode::Online && automatic &&
+        WiFi.status() != WL_CONNECTED) {
+        outageActionChoice = true;
+        screen = Screen::ActionChoice;
+        drawActionChoice();
+        return;
+    }
+    const bool queueLocally =
+        config.mode == Mode::Online &&
+        (outageActionChoice || WiFi.status() != WL_CONNECTED);
+    outageActionChoice = false;
+    const String eventId = String(esp_random(), HEX) + "-" +
+                           String(esp_random(), HEX) + "-" +
+                           String(++eventCounter);
+    const String photo = capturePhoto(selectedEmployee, eventId);
+    if (config.mode == Mode::Online) {
+        if (queueLocally) {
+            if (appendPendingOnlineAttendance(selectedEmployee, action, eventId, photo)) {
+                attendanceConfirmationSuccess = true;
+                attendanceConfirmationTitle =
+                    text("Zapisano tymczasowo — brak połączenia",
+                         "Saved temporarily — no connection",
+                         "Guardado temporalmente — sin conexión",
+                         "Vorübergehend gespeichert — keine Verbindung");
+                attendanceConfirmationName =
+                    selectedEmployee.firstName + " " + selectedEmployee.lastName;
+                addLog("WARN", "ONLINE_ATTENDANCE_QUEUED",
+                       eventId + ":" +
+                           (action == AttendanceAction::Entry ? "ENTRY" : "EXIT"));
+            } else {
+                attendanceConfirmationSuccess = false;
+                attendanceConfirmationTitle =
+                    text("BŁĄD ZAPISU — odbicie nie zostało zapisane",
+                         "SAVE ERROR — punch was not recorded",
+                         "ERROR — registro no guardado",
+                         "SPEICHERFEHLER — Buchung nicht gespeichert");
+                attendanceConfirmationName = "";
+            }
+            screen = Screen::AttendanceConfirmation;
+            screenSince = millis();
+            attendanceConfirmationUntil = screenSince + kAttendanceConfirmationMs;
+            drawAttendanceConfirmation();
+            return;
+        }
+        if (queueOnlineAttendance(selectedEmployee, action, eventId, photo, automatic)) {
+            attendanceConfirmationSuccess = false;
+            attendanceConfirmationTitle =
+                text("Zapisywanie odbicia...", "Saving punch...",
+                     "Guardando registro...", "Buchung wird gespeichert...");
+            attendanceConfirmationName =
+                selectedEmployee.firstName + " " + selectedEmployee.lastName;
+            screen = Screen::AttendanceConfirmation;
+            screenSince = millis();
+            attendanceConfirmationUntil = screenSince + kAttendanceConfirmationMs;
+            drawAttendanceConfirmation();
+            return;
+        }
+        if (WiFi.status() != WL_CONNECTED) {
+            if (automatic) {
+                outageActionChoice = true;
+                screen = Screen::ActionChoice;
+                drawActionChoice();
+                return;
+            }
+            if (appendPendingOnlineAttendance(selectedEmployee, action,
+                                              eventId, photo)) {
+                attendanceConfirmationSuccess = true;
+                attendanceConfirmationTitle =
+                    text("Zapisano tymczasowo — brak połączenia",
+                         "Saved temporarily — no connection",
+                         "Guardado temporalmente — sin conexión",
+                         "Vorübergehend gespeichert — keine Verbindung");
+                attendanceConfirmationName =
+                    selectedEmployee.firstName + " " + selectedEmployee.lastName;
+                addLog("WARN", "ONLINE_ATTENDANCE_QUEUED",
+                       eventId + ":" +
+                           (action == AttendanceAction::Entry ? "ENTRY" : "EXIT"));
+                screen = Screen::AttendanceConfirmation;
+                screenSince = millis();
+                attendanceConfirmationUntil = screenSince + kAttendanceConfirmationMs;
+                drawAttendanceConfirmation();
+                return;
+            }
+            attendanceConfirmationSuccess = false;
+            attendanceConfirmationTitle =
+                text("BŁĄD ZAPISU — odbicie nie zostało zapisane",
+                     "SAVE ERROR — punch was not recorded",
+                     "ERROR — registro no guardado",
+                     "SPEICHERFEHLER — Buchung nicht gespeichert");
+            attendanceConfirmationName = "";
+            screen = Screen::AttendanceConfirmation;
+            screenSince = millis();
+            attendanceConfirmationUntil = screenSince + kAttendanceConfirmationMs;
+            drawAttendanceConfirmation();
+            return;
+        }
+        attendanceConfirmationSuccess = false;
+        if (lastMessage.isEmpty()) {
+            lastMessage = text("Nie można wysłać zdarzenia",
+                               "Could not queue event",
+                               "No se pudo enviar el evento",
+                               "Ereignis konnte nicht gesendet werden");
+        }
+        attendanceConfirmationTitle = lastMessage;
+        attendanceConfirmationName = "";
+        screenSince = millis();
+        attendanceConfirmationUntil = screenSince + kAttendanceConfirmationMs;
+        screen = Screen::AttendanceConfirmation;
+        drawAttendanceConfirmation();
+        return;
+    }
     String recordedType;
-    if (!appendAttendance(selectedEmployee, action, photo, automatic, recordedType)) {
+    if (!appendAttendance(selectedEmployee, action, eventId, photo, recordedType)) {
         attendanceConfirmationSuccess = false;
         if (lastMessage.isEmpty()) {
             lastMessage = text("Błąd zapisu", "Write failed", "Error al guardar",
@@ -1023,10 +2169,68 @@ void processAttendance(AttendanceAction action, bool automatic = false) {
     drawAttendanceConfirmation();
 }
 
-String capturePhoto() {
+String photoNameComponent(const String& value) {
+    String result;
+    result.reserve(min<size_t>(value.length(), 32));
+    bool previousUnderscore = false;
+    for (size_t index = 0; index < value.length() && result.length() < 32;) {
+        const uint8_t character = static_cast<uint8_t>(value[index]);
+        if (character >= 0x80) {
+            size_t sequenceLength = (character & 0xE0) == 0xC0 ? 2
+                                    : (character & 0xF0) == 0xE0 ? 3
+                                    : (character & 0xF8) == 0xF0 ? 4
+                                                                  : 0;
+            if (sequenceLength == 0 || index + sequenceLength > value.length() ||
+                result.length() + sequenceLength > 32) {
+                break;
+            }
+            bool validSequence = true;
+            for (size_t offset = 1; offset < sequenceLength; ++offset) {
+                if ((static_cast<uint8_t>(value[index + offset]) & 0xC0) != 0x80) {
+                    validSequence = false;
+                    break;
+                }
+            }
+            if (!validSequence) {
+                ++index;
+                continue;
+            }
+            for (size_t offset = 0; offset < sequenceLength; ++offset) {
+                result += value[index + offset];
+            }
+            index += sequenceLength;
+            previousUnderscore = false;
+            continue;
+        }
+        const bool allowed =
+            (character >= 'a' && character <= 'z') ||
+            (character >= 'A' && character <= 'Z') ||
+            (character >= '0' && character <= '9') ||
+            character == '-' || character == '_';
+        if (allowed) {
+            result += static_cast<char>(character);
+            previousUnderscore = character == '_';
+        } else if (!previousUnderscore && !result.isEmpty()) {
+            result += '_';
+            previousUnderscore = true;
+        }
+        ++index;
+    }
+    while (result.endsWith("_") || result.endsWith(".")) {
+        result.remove(result.length() - 1);
+    }
+    return result.isEmpty() ? String("unknown") : result;
+}
+
+String capturePhoto(const Employee& employee, const String& eventId) {
     if (!config.cameraEnabled) return "";
     if (!cameraAvailable || !sdAvailable) {
         addLog("WARN", "CAMERA_UNAVAILABLE", "Aparat niedostępny");
+        return "";
+    }
+    if (!rtcAvailable) {
+        addLog("ERROR", "PHOTO_TIMESTAMP_UNAVAILABLE",
+               "Nie można nadać zdjęciu daty i godziny bez RTC");
         return "";
     }
     camera_fb_t* frame = esp_camera_fb_get();
@@ -1034,8 +2238,29 @@ String capturePhoto() {
         addLog("ERROR", "CAMERA_CAPTURE_FAILED", "Nie udało się wykonać zdjęcia");
         return "";
     }
-    if (!SD.exists("/photos")) SD.mkdir("/photos");
-    const String path = String("/photos/") + String(millis()) + ".jpg";
+    const DateTime now = rtc.now();
+    char timestamp[14];
+    snprintf(timestamp, sizeof(timestamp), "%04d%02d%02d_%02d%02d",
+             now.year(), now.month(), now.day(), now.hour(), now.minute());
+    const String filenameBase =
+        photoNameComponent(employee.lastName) + "_" +
+        photoNameComponent(employee.firstName) + "_" +
+        photoNameComponent(employee.id) + "_" + timestamp;
+    String path = String("/photos/") + filenameBase + ".jpg";
+    if (!SD.exists("/photos") && !SD.mkdir("/photos")) {
+        esp_camera_fb_return(frame);
+        addLog("ERROR", "PHOTO_WRITE_FAILED", "Nie można utworzyć katalogu zdjęć");
+        return "";
+    }
+    if (SD.exists(path)) {
+        path = String("/photos/") + filenameBase + "_" +
+               photoNameComponent(eventId) + ".jpg";
+        if (SD.exists(path)) {
+            esp_camera_fb_return(frame);
+            addLog("ERROR", "PHOTO_NAME_COLLISION", eventId);
+            return "";
+        }
+    }
     File file = SD.open(path, FILE_WRITE);
     if (!file) {
         esp_camera_fb_return(frame);
@@ -1044,10 +2269,12 @@ String capturePhoto() {
     }
     const size_t expected = frame->len;
     const size_t written = file.write(frame->buf, expected);
+    file.flush();
+    const bool writeOk = written == expected && file.getWriteError() == 0;
     file.close();
     esp_camera_fb_return(frame);
-    if (written != expected) {
-        addLog("ERROR", "PHOTO_WRITE_FAILED", "Zapis zdjęcia zwrócił zero bajtów");
+    if (!writeOk) {
+        addLog("ERROR", "PHOTO_WRITE_FAILED", "Niepełny zapis zdjęcia");
         SD.remove(path);
         return "";
     }
@@ -1125,22 +2352,72 @@ void drawButton(int16_t x, int16_t y, int16_t width, int16_t height,
     display.fillRoundRect(x, y, width, height, 12, fill);
     display.drawRoundRect(x, y, width, height, 12, color(210, 222, 241));
     display.setTextColor(color(250, 252, 255), fill);
-    setUiTextSize(2.5f);
-    display.drawCenterString(label, x + width / 2, y + height / 2 - 8);
+    drawFittedText(label, x, y, width, height, readableUiSize(3.1f),
+                   lgfx::textdatum_t::middle_center);
+}
+
+void drawLeftAlignedButton(int16_t x, int16_t y, int16_t width, int16_t height,
+                           const String& label, uint16_t fill) {
+    display.fillRoundRect(x, y, width, height, 12, fill);
+    display.drawRoundRect(x, y, width, height, 12, color(210, 222, 241));
+    display.setTextColor(color(250, 252, 255), fill);
+    drawFittedText(label, x + 18, y, width - 32, height, readableUiSize(3.1f),
+                   lgfx::textdatum_t::middle_left);
 }
 
 void drawHomeQuoteArea() {
     const uint16_t panelColor = color(22, 32, 54);
-    display.fillRect(28, 207, 424, 62, panelColor);
+    display.fillRoundRect(24, 188, 432, 84, 12, panelColor);
     if (lastMessage.isEmpty()) {
         const char* quote = dailyMotivationQuote();
-        const size_t quoteLength = strlen(quote);
-        const float quoteSize = quoteLength > 72 ? 0.9f
-                                : quoteLength > 54 ? 1.05f
-                                : quoteLength > 38 ? 1.2f : 1.4f;
-        display.setTextColor(color(129, 172, 255), panelColor);
-        setUiTextSize(quoteSize);
-        display.drawCenterString(quote, 240, 209);
+        float quoteSize = 3.1f;
+        String lines[3];
+        uint8_t lineCount = 0;
+        bool wrapped = false;
+        for (; quoteSize >= 1.25f && !wrapped; quoteSize -= 0.1f) {
+            lines[0] = "";
+            lines[1] = "";
+            lines[2] = "";
+            uint8_t line = 0;
+            wrapped = true;
+            setUiTextSize(readableUiSize(quoteSize));
+            String remaining(quote);
+            while (!remaining.isEmpty()) {
+                const int space = remaining.indexOf(' ');
+                const String word = space < 0
+                                        ? remaining
+                                        : remaining.substring(0, space);
+                const String candidate = lines[line].isEmpty()
+                                             ? word
+                                             : lines[line] + " " + word;
+                if (!lines[line].isEmpty() &&
+                    display.textWidth(candidate) > 408) {
+                    if (line == 2) {
+                        wrapped = false;
+                        break;
+                    }
+                    ++line;
+                    lines[line] = word;
+                } else {
+                    lines[line] = candidate;
+                }
+                remaining = space < 0 ? "" : remaining.substring(space + 1);
+            }
+            lineCount = line + 1;
+        }
+        if (!wrapped) {
+            lines[0] = quote;
+            lineCount = 1;
+            quoteSize = 1.25f;
+        } else {
+            quoteSize += 0.1f;
+        }
+        const int16_t lineHeight = 60 / lineCount;
+        for (uint8_t line = 0; line < lineCount; ++line) {
+            drawFittedText(lines[line], 32, 188 + line * lineHeight, 416,
+                           lineHeight, readableUiSize(quoteSize),
+                           lgfx::textdatum_t::middle_center);
+        }
     }
 
     const char* prompt = lastMessage.isEmpty()
@@ -1148,10 +2425,11 @@ void drawHomeQuoteArea() {
                                     "Acerque la tarjeta", "Karte vorhalten")
                              : lastMessage.c_str();
     display.setTextColor(lastMessage.isEmpty() ? color(174, 190, 215)
-                                                : color(255, 191, 87),
+                                                : color(255, 205, 112),
                          panelColor);
-    setUiTextSize(strlen(prompt) > 48 ? 0.9f : 1.25f);
-    display.drawCenterString(prompt, 240, 240);
+    drawFittedText(prompt, 34, 248, 412, 22,
+                   readableUiSize(strlen(prompt) > 48 ? 1.35f : 1.9f),
+                   lgfx::textdatum_t::middle_center);
     if (rtcAvailable) {
         const DateTime now = rtc.now();
         char dateKey[11];
@@ -1162,67 +2440,80 @@ void drawHomeQuoteArea() {
 }
 
 void drawHome() {
-    display.fillScreen(color(10, 17, 33));
-    display.fillRoundRect(16, 16, 448, 288, 20, color(22, 32, 54));
+    drawScreenBackground();
+    const uint16_t panelColor = color(22, 32, 54);
+    if (!wallpaperEnabled || wallpaperPixels == nullptr) {
+        display.fillRoundRect(16, 16, 448, 288, 20, panelColor);
+    } else {
+        display.fillRoundRect(12, 12, 456, 42, 10, color(10, 17, 33));
+        display.fillRoundRect(12, 270, 456, 40, 10, color(10, 17, 33));
+    }
+    display.fillRoundRect(32, 59, 416, 84, 14, panelColor);
+    display.fillRoundRect(68, 145, 344, 40, 12, panelColor);
     display.setTextColor(color(129, 172, 255));
-    setUiTextSize(1.5f);
-    display.drawString("RCP2027 PROMIR-BUD PASSION LINE", 28, 30);
+    drawFittedText("RCP2027 PROMIR-BUD PASSION LINE",
+                   24, 14, 350, 34, readableUiSize(1.9f),
+                   lgfx::textdatum_t::middle_left);
     display.setTextColor(color(174, 190, 215));
     setUiTextSize(1.5f);
-    display.drawRightString(config.mode == Mode::Offline ? "OFFLINE" : "ONLINE",
-                            442, 48);
+    drawFittedText(config.mode == Mode::Offline ? "OFFLINE" : "ONLINE",
+                   366, 16, 88, 30, 1.5f, lgfx::textdatum_t::middle_center);
     display.setTextColor(color(248, 250, 255));
-    setUiTextSize(7.5f);
     if (rtcAvailable) {
         const DateTime now = rtc.now();
         char clockText[10];
         snprintf(clockText, sizeof(clockText), "%02d:%02d:%02d",
                  now.hour(), now.minute(), now.second());
-        display.drawCenterString(clockText, 240, 112);
+        display.setTextColor(color(248, 250, 255));
+        drawFittedText(clockText, 40, 62, 396, 77, 9.0f,
+                       lgfx::textdatum_t::middle_center);
         char dateText[20];
         snprintf(dateText, sizeof(dateText), "%04d-%02d-%02d",
                  now.year(), now.month(), now.day());
         lastHomeDate = dateText;
-        setUiTextSize(3.5f);
         display.setTextColor(color(174, 190, 215));
-        display.drawCenterString(dateText, 240, 182);
+        drawFittedText(dateText, 70, 145, 336, 40, 3.8f,
+                       lgfx::textdatum_t::middle_center);
     } else {
-        setUiTextSize(2.5f);
         display.setTextColor(color(255, 191, 87));
-        display.drawCenterString(text("Brak zegara RTC", "RTC unavailable",
-                                      "RTC no disponible", "RTC nicht verfügbar"),
-                                 240, 130);
+        drawFittedText(text("Brak zegara RTC", "RTC unavailable",
+                            "RTC no disponible", "RTC nicht verfügbar"),
+                       50, 75, 380, 66, 2.5f,
+                       lgfx::textdatum_t::middle_center);
     }
     drawHomeQuoteArea();
-    setUiTextSize(1.6f);
     display.setTextColor(color(205, 216, 232));
-    display.drawString(configurationValid ? (sdAvailable ? "SD OK" : "SD ERROR")
-                                          : "CONFIG ERROR",
-                       36, 278);
-    display.drawString(rfidAvailable ? "RFID OK" : "RFID ERROR", 145, 278);
-    display.drawString(config.mode == Mode::Online
-                           ? (WiFi.status() == WL_CONNECTED ? "WIFI OK" : "WIFI ERROR")
-                           : "OFFLINE",
-                       248, 278);
-    display.drawRightString(text("USTAWIENIA", "SETTINGS", "AJUSTES", "EINSTELLUNGEN"),
-                            442, 274);
+    drawFittedText(configurationValid ? (sdAvailable ? "SD OK" : "SD ERROR")
+                                      : "CONFIG ERROR",
+                   20, 270, 92, 36, readableUiSize(1.7f),
+                   lgfx::textdatum_t::middle_left);
+    drawFittedText(rfidAvailable ? "RFID OK" : "RFID ERROR",
+                   120, 270, 92, 36, readableUiSize(1.7f),
+                   lgfx::textdatum_t::middle_left);
+    drawFittedText(config.mode == Mode::Online
+                       ? (WiFi.status() == WL_CONNECTED ? "WIFI OK" : "WIFI ERROR")
+                       : "OFFLINE",
+                   220, 270, 112, 36, readableUiSize(1.7f),
+                   lgfx::textdatum_t::middle_left);
+    drawButton(340, 270, 120, 36,
+               text("USTAWIENIA", "SETTINGS", "AJUSTES", "EINSTELLUNGEN"),
+               color(45, 101, 191));
 }
 
 void drawAttendanceConfirmation() {
-    display.fillScreen(color(10, 17, 33));
-    display.fillRoundRect(20, 28, 440, 264, 20, color(22, 32, 54));
+    drawScreenBackground();
+    display.fillRoundRect(28, 82, 424, 142, 20, color(22, 32, 54));
     const uint16_t accent = attendanceConfirmationSuccess
                                 ? color(113, 230, 173)
                                 : color(255, 191, 87);
     display.setTextColor(accent);
-    setUiTextSize(2.8f);
-    display.drawCenterString(attendanceConfirmationTitle, 240, 104);
+    drawFittedText(attendanceConfirmationTitle, 40, 94, 400, 55, 2.8f,
+                   lgfx::textdatum_t::middle_center);
 
     if (attendanceConfirmationSuccess) {
         display.setTextColor(color(248, 250, 255));
-        const size_t nameLength = attendanceConfirmationName.length();
-        setUiTextSize(nameLength > 24 ? 1.8f : nameLength > 16 ? 2.2f : 2.8f);
-        display.drawCenterString(attendanceConfirmationName, 240, 164);
+        drawFittedText(attendanceConfirmationName, 40, 153, 400, 52,
+                       2.8f, lgfx::textdatum_t::middle_center);
     }
 }
 
@@ -1288,15 +2579,46 @@ void removeLastInputCharacter(String& value) {
 void drawEmployeeEnrollment() {
     display.fillScreen(color(10, 17, 33));
     display.setTextColor(color(246, 249, 255));
-    setUiTextSize(2);
-    display.drawCenterString(text("Nowy pracownik", "New employee",
-                                  "Nuevo empleado", "Neuer Mitarbeiter"),
-                             240, 7);
-    setUiTextSize(1);
-    display.setTextColor(lastMessage.isEmpty() ? color(174, 190, 215)
-                                               : color(255, 150, 150));
-    display.drawCenterString(
-        lastMessage.isEmpty() ? "UID: " + pendingEmployeeUid : lastMessage, 240, 32);
+    drawFittedText(text("Nowy pracownik", "New employee",
+                        "Nuevo empleado", "Neuer Mitarbeiter"),
+                   20, 3, 440, 25, readableUiSize(1.8f),
+                   lgfx::textdatum_t::middle_center);
+    display.fillRoundRect(16, 30, 448, 44, 8,
+                          lastMessage.isEmpty() ? color(22, 32, 54)
+                                                : color(104, 35, 45));
+    if (lastMessage.isEmpty()) {
+        display.setTextColor(color(174, 190, 215));
+        drawFittedText(text("Wprowadź dane pracownika",
+                            "Enter employee details",
+                            "Introduzca los datos del empleado",
+                            "Mitarbeiterdaten eingeben"),
+                       24, 32, 432, 40, readableUiSize(1.9f),
+                       lgfx::textdatum_t::middle_center);
+    } else {
+        display.setTextColor(color(255, 239, 240));
+        String firstLine;
+        String secondLine;
+        String remaining = lastMessage;
+        setUiTextSize(readableUiSize(2.0f));
+        while (!remaining.isEmpty()) {
+            const int space = remaining.indexOf(' ');
+            const String word = space < 0 ? remaining : remaining.substring(0, space);
+            const String candidate = firstLine.isEmpty() ? word : firstLine + " " + word;
+            if (!firstLine.isEmpty() && display.textWidth(candidate) > 420) {
+                secondLine = remaining;
+                break;
+            }
+            firstLine = candidate;
+            remaining = space < 0 ? "" : remaining.substring(space + 1);
+        }
+        drawFittedText(firstLine, 24, 31, 432, secondLine.isEmpty() ? 42 : 21,
+                       readableUiSize(2.0f),
+                       lgfx::textdatum_t::middle_center);
+        if (!secondLine.isEmpty()) {
+            drawFittedText(secondLine, 24, 51, 432, 21, readableUiSize(2.0f),
+                           lgfx::textdatum_t::middle_center);
+        }
+    }
 
     const char* labels[] = {
         text("ID", "ID", "ID", "ID"),
@@ -1304,17 +2626,20 @@ void drawEmployeeEnrollment() {
         text("Nazwisko", "Last name", "Apellido", "Nachname")
     };
     for (uint8_t field = 0; field < 3; ++field) {
-        const int y = 48 + field * 32;
+        const int y = 78 + field * 27;
         const uint16_t border = field == enrollmentField
                                     ? color(129, 172, 255)
                                     : color(75, 92, 121);
-        display.fillRoundRect(20, y, 440, 32, 6, color(22, 32, 54));
-        display.drawRoundRect(20, y, 440, 32, 6, border);
+        display.fillRoundRect(20, y, 440, 26, 6, color(22, 32, 54));
+        display.drawRoundRect(20, y, 440, 26, 6, border);
         display.setTextColor(color(174, 190, 215));
-        setUiTextSize(2);
-        display.drawString(String(labels[field]) + ":", 29, y + 7);
+        drawFittedText(String(labels[field]) + ":", 28, y + 3, 82, 20,
+                       readableUiSize(1.5f),
+                       lgfx::textdatum_t::middle_left);
         display.setTextColor(color(250, 252, 255));
-        display.drawString(*enrollmentFieldValue(field), 115, y + 7);
+        drawFittedText(*enrollmentFieldValue(field), 115, y + 3, 335, 20,
+                       readableUiSize(1.5f),
+                       lgfx::textdatum_t::middle_left);
     }
 
     const String relayLabel =
@@ -1322,7 +2647,7 @@ void drawEmployeeEnrollment() {
                     "Acceso al relé: ", "Relaiszugriff: ")) +
         (newEmployeeRelayAccess ? text("TAK", "YES", "SÍ", "JA")
                                 : text("NIE", "NO", "NO", "NEIN"));
-    drawButton(20, 150, 440, 25, relayLabel,
+    drawButton(20, 161, 440, 23, relayLabel,
                newEmployeeRelayAccess ? color(25, 116, 88) : color(39, 54, 82));
 
     const char* alphaRows[] = {
@@ -1348,17 +2673,17 @@ void drawEmployeeEnrollment() {
                 label.toLowerCase();
             }
             const int x = start + index * 44;
-            drawButton(x, 179 + row * 33, 40, 29, label, color(39, 54, 82));
+            drawButton(x, 184 + row * 30, 40, 27, label, color(39, 54, 82));
         }
     }
 
-    drawButton(15, 275, 74, 20,
+    drawButton(15, 273, 74, 20,
                enrollmentNumericKeyboard ? "ABC" : "123", color(52, 73, 109));
-    drawButton(96, 275, 68, 20, "a/A", color(52, 73, 109));
-    drawButton(171, 275, 54, 20, enrollmentAccentCharacter(), color(52, 73, 109));
-    drawButton(232, 275, 102, 20,
+    drawButton(96, 273, 68, 20, "a/A", color(52, 73, 109));
+    drawButton(171, 273, 54, 20, enrollmentAccentCharacter(), color(52, 73, 109));
+    drawButton(232, 273, 102, 20,
                text("Spacja", "Space", "Espacio", "Leer"), color(52, 73, 109));
-    drawButton(341, 275, 124, 20,
+    drawButton(341, 273, 124, 20,
                text("Usuń znak", "Backspace", "Borrar", "Löschen"),
                color(103, 47, 58));
     drawButton(65, 298, 150, 20,
@@ -1373,42 +2698,85 @@ void refreshHomeClock() {
     char clockText[10];
     snprintf(clockText, sizeof(clockText), "%02d:%02d:%02d",
              now.hour(), now.minute(), now.second());
-    setUiTextSize(7.5f);
-    display.setTextColor(color(248, 250, 255), color(22, 32, 54));
-    display.drawCenterString(clockText, 240, 112);
+    display.fillRoundRect(32, 59, 416, 84, 14, color(22, 32, 54));
+    display.setTextColor(color(248, 250, 255));
+    drawFittedText(clockText, 40, 62, 396, 77, 9.0f,
+                   lgfx::textdatum_t::middle_center);
 
     char dateText[20];
     snprintf(dateText, sizeof(dateText), "%04d-%02d-%02d",
              now.year(), now.month(), now.day());
     if (lastHomeDate != dateText) {
         lastHomeDate = dateText;
-        setUiTextSize(3.5f);
-        display.setTextColor(color(174, 190, 215), color(22, 32, 54));
-        display.drawCenterString(dateText, 240, 182);
+        display.fillRoundRect(68, 145, 344, 40, 12, color(22, 32, 54));
+        display.setTextColor(color(174, 190, 215));
+        drawFittedText(dateText, 70, 145, 336, 40, 3.8f,
+                       lgfx::textdatum_t::middle_center);
     }
     if (lastHomeQuoteDate != dateText) drawHomeQuoteArea();
 }
 
 void drawActionChoice() {
     display.fillScreen(color(10, 17, 33));
+    if (outageActionChoice) {
+        display.setTextColor(color(255, 205, 112));
+        drawFittedText(text("BRAK POŁĄCZENIA", "NO CONNECTION",
+                            "SIN CONEXIÓN", "KEINE VERBINDUNG"),
+                       24, 20, 432, 42, readableUiSize(2.4f),
+                       lgfx::textdatum_t::middle_center);
+        display.setTextColor(color(246, 249, 255));
+        drawFittedText(selectedEmployee.firstName + " " + selectedEmployee.lastName,
+                       24, 66, 432, 42, readableUiSize(2.0f),
+                       lgfx::textdatum_t::middle_center);
+        display.setTextColor(color(221, 230, 246));
+        drawFittedText(text("Potwierdź rodzaj odbicia",
+                            "Confirm attendance action",
+                            "Confirme la acción",
+                            "Buchungsart bestätigen"),
+                       24, 110, 432, 34, readableUiSize(1.8f),
+                       lgfx::textdatum_t::middle_center);
+        drawButton(25, 154, 205, 72,
+                   text("WEJŚCIE", "CLOCK IN", "ENTRADA", "KOMMEN"),
+                   color(25, 139, 103));
+        drawButton(250, 154, 205, 72,
+                   text("WYJŚCIE", "CLOCK OUT", "SALIDA", "GEHEN"),
+                   color(45, 101, 191));
+        if (selectedEmployee.relayAccess) {
+            drawButton(115, 236, 250, 54,
+                       text("Otwórz drzwi", "Unlock door",
+                            "Abrir puerta", "Tür öffnen"),
+                       color(164, 94, 34));
+        }
+        return;
+    }
     display.setTextColor(color(246, 249, 255));
     setUiTextSize(2);
     display.drawCenterString(selectedEmployee.firstName + " " + selectedEmployee.lastName,
                              240, 34);
     display.setTextColor(color(174, 190, 215));
     setUiTextSize(1);
-    display.drawCenterString(text("Wybierz czynność", "Choose an action",
-                                  "Elija una acción", "Aktion wählen"),
-                             240, 72);
-    drawButton(30, 108, 200, 78,
-               text("Wejście", "Clock in", "Entrada", "Kommen"),
-               color(25, 139, 103));
-    drawButton(250, 108, 200, 78,
-               text("Wyjście", "Clock out", "Salida", "Gehen"),
-               color(45, 101, 191));
-    drawButton(30, 204, 420, 74,
-               text("Odblokuj drzwi", "Unlock door", "Abrir puerta", "Tür öffnen"),
-               color(164, 94, 34));
+    display.drawCenterString(
+        selectedEmployeePresent
+            ? text("Jesteś na zakładzie — wybierz", "On site — choose an action",
+                   "Está en el trabajo — elija", "Anwesend — Aktion wählen")
+            : text("Poza zakładem — zarejestruj wejście",
+                   "Off site — clock in",
+                   "Fuera — registre la entrada",
+                   "Abwesend — einstempeln"),
+        240, 72);
+    if (selectedEmployeePresent) {
+        drawButton(30, 132, 200, 92,
+                   text("Wyjście", "Clock out", "Salida", "Gehen"),
+                   color(45, 101, 191));
+        drawButton(250, 132, 200, 92,
+                   text("Otwórz drzwi", "Unlock door", "Abrir puerta",
+                        "Tür öffnen"),
+                   color(164, 94, 34));
+    } else {
+        drawButton(70, 132, 340, 92,
+                   text("Wejście", "Clock in", "Entrada", "Kommen"),
+                   color(25, 139, 103));
+    }
 }
 
 void drawPinEntry() {
@@ -1450,24 +2818,23 @@ void drawSettings() {
         {"Tryb pracy", "Operating mode", "Modo de operación", "Betriebsmodus"},
         {"Zdjęcia", "Photos", "Fotos", "Fotos"},
         {"Czcionka", "Font", "Fuente", "Schriftart"},
+        {"Tryb kolorów", "Color mode", "Modo de color", "Farbmodus"},
         {"Pracownicy", "Employees", "Empleados", "Mitarbeiter"},
         {"Data i godzina", "Date and time", "Fecha y hora", "Datum und Uhrzeit"},
         {"Zmień PIN", "Change PIN", "Cambiar PIN", "PIN ändern"},
         {"Kalibruj dotyk", "Calibrate touch", "Calibrar pantalla",
-         "Touchscreen kalibrieren"}
+         "Touchscreen kalibrieren"},
+        {"Wi-Fi", "Wi-Fi", "Wi-Fi", "WLAN"},
+        {"Tapeta", "Wallpaper", "Fondo", "Hintergrund"}
     };
-    constexpr size_t kVisibleSettings = 5;
-    constexpr int kSettingsRowY = 49;
-    constexpr int kSettingsRowHeight = 43;
-    constexpr size_t kTotalSettings = 8;
     const size_t maxScroll = kTotalSettings - kVisibleSettings;
     if (settingsScroll > maxScroll) settingsScroll = maxScroll;
 
     display.fillScreen(color(10, 17, 33));
     display.setTextColor(color(246, 249, 255));
-    setUiTextSize(1.8f);
-    display.drawCenterString(text("Ustawienia", "Settings", "Ajustes", "Einstellungen"),
-                             240, 12);
+    drawFittedText(text("Ustawienia", "Settings", "Ajustes", "Einstellungen"),
+                   24, 3, 432, 32, readableUiSize(2.0f),
+                   lgfx::textdatum_t::middle_center);
     for (size_t row = 0; row < kVisibleSettings; ++row) {
         const size_t index = settingsScroll + row;
         const int y = kSettingsRowY + static_cast<int>(row) * kSettingsRowHeight;
@@ -1490,22 +2857,362 @@ void drawSettings() {
             label += ": ";
             label += uiFontLabel();
         } else if (index == 4) {
+            label += ": ";
+            label += displayInverted
+                         ? text("Jasny", "Light", "Claro", "Hell")
+                         : text("Ciemny", "Dark", "Oscuro", "Dunkel");
+        } else if (index == 5) {
             label += " (" + String(activeEmployeeCount()) + ")";
+        } else if (index == 9) {
+            label += ": ";
+            label += config.ssid.isEmpty()
+                         ? text("Nie skonfigurowano", "Not configured",
+                                "Sin configurar", "Nicht eingerichtet")
+                         : config.ssid.substring(0, 16) +
+                               (config.ssid.length() > 16 ? "..." : "");
+        } else if (index == 10) {
+            label += ": ";
+            label += wallpaperEnabled
+                         ? text("WŁĄCZONA", "ON", "ACTIVADO", "EIN")
+                         : text("WYŁĄCZONA", "OFF", "DESACTIVADO", "AUS");
         }
-        drawButton(20, y, 420, 39, label,
-                   index == 2 && config.cameraEnabled && !cameraAvailable
-                       ? color(103, 67, 36)
-                       : color(39, 54, 82));
+        drawLeftAlignedButton(20, y, 400, kSettingsRowHeight - 4, label,
+                              index == 2 && config.cameraEnabled && !cameraAvailable
+                                  ? color(103, 67, 36)
+                                  : color(39, 54, 82));
     }
-    drawVerticalScrollbar(462, kSettingsRowY, 5 * kSettingsRowHeight - 4,
+    drawVerticalScrollbar(450, kSettingsRowY,
+                          kVisibleSettings * kSettingsRowHeight - 4,
                           kTotalSettings, kVisibleSettings, settingsScroll);
-    drawButton(170, 274, 140, 38,
+    if (!lastMessage.isEmpty()) {
+        display.fillRoundRect(30, 253, 420, 24, 7, color(72, 48, 24));
+        display.setTextColor(color(255, 205, 112));
+        drawFittedText(lastMessage, 38, 254, 404, 22, readableUiSize(1.5f),
+                       lgfx::textdatum_t::middle_center);
+    }
+    drawButton(115, 280, 250, 35,
                text("Powrót", "Back", "Volver", "Zurück"),
                color(45, 101, 191));
-    if (!lastMessage.isEmpty()) {
-        setUiTextSize(0.6f);
-        display.setTextColor(color(255, 191, 87));
-        display.drawCenterString(lastMessage, 240, 262);
+}
+
+void drawWifiSetup() {
+    display.fillScreen(color(10, 17, 33));
+    display.setTextColor(color(246, 249, 255));
+    drawFittedText(text("Połączenie z siecią Wi-Fi",
+                        "Connect to Wi-Fi",
+                        "Conexión Wi-Fi",
+                        "WLAN-Verbindung"),
+                        24, 2, 432, 26, readableUiSize(2.0f),
+                   lgfx::textdatum_t::middle_center);
+    display.setTextColor(wifiStatusMessage.isEmpty() ? color(174, 190, 215)
+                                                     : color(255, 205, 112));
+    const String status = wifiStatusMessage.isEmpty()
+                              ? text("Wybierz sieć z listy",
+                                     "Select a network",
+                                     "Seleccione una red",
+                                     "Netzwerk auswählen")
+                              : wifiStatusMessage;
+    drawFittedText(status, 22, 29, 436, 34, readableUiSize(1.6f),
+                   lgfx::textdatum_t::middle_center);
+
+    const size_t visibleCount =
+        min(kVisibleWifiNetworks, wifiNetworks.size() > wifiNetworkScroll
+                                     ? wifiNetworks.size() - wifiNetworkScroll
+                                     : size_t{0});
+    for (size_t row = 0; row < visibleCount; ++row) {
+        const WifiNetwork& network = wifiNetworks[wifiNetworkScroll + row];
+        const int y = kWifiNetworkRowY + static_cast<int>(row) *
+                                             kWifiNetworkRowHeight;
+        display.fillRoundRect(115, y, 250, kWifiNetworkRowHeight - 4, 8,
+                              color(39, 54, 82));
+        display.setTextColor(color(250, 252, 255));
+        String name = network.ssid;
+        if (name.length() > 30) name = name.substring(0, 27) + "...";
+        drawFittedText(name, 121, y + 2, 238, 24, readableUiSize(2.0f),
+                       lgfx::textdatum_t::middle_left);
+        display.setTextColor(color(174, 190, 215));
+        drawFittedText(
+            String(network.rssi) + " dBm  " +
+                (network.open ? text("Otwarta", "Open", "Abierta", "Offen")
+                              : text("Zabezpieczona", "Secured",
+                                     "Protegida", "Gesichert")),
+            121, y + 25, 238, 17, readableUiSize(1.45f),
+            lgfx::textdatum_t::middle_left);
+    }
+    if (wifiNetworks.empty() && !wifiScanInProgress) {
+        display.setTextColor(color(174, 190, 215));
+        drawFittedText(text("Nie znaleziono sieci",
+                            "No networks found",
+                            "No se encontraron redes",
+                            "Keine Netzwerke gefunden"),
+                       24, 122, 412, 42, readableUiSize(1.8f),
+                       lgfx::textdatum_t::middle_center);
+    }
+    drawVerticalScrollbar(
+        450, kWifiNetworkRowY, kVisibleWifiNetworks * kWifiNetworkRowHeight - 4,
+        wifiNetworks.size(), kVisibleWifiNetworks, wifiNetworkScroll);
+    drawButton(30, 277, 195, 36,
+               text("Szukaj ponownie", "Scan again",
+                    "Buscar de nuevo", "Erneut suchen"),
+               color(45, 101, 191));
+    drawButton(255, 277, 195, 36,
+               text("Powrót", "Back", "Volver", "Zurück"),
+               color(103, 47, 58));
+}
+
+void drawWifiPassword() {
+    static constexpr const char* letterRows[] = {
+        "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"
+    };
+    static constexpr const char* numberRows[] = {
+        "1234567890", "!@#$%^&*()", "-_=+[]{};:"
+    };
+    static constexpr const char* symbolRows[] = {
+        ".,/?<>\\|~`", "'\"();:{}[]", "+-_*&^%$#@"
+    };
+    static constexpr int letterStarts[] = {20, 42, 86};
+    static constexpr int letterLengths[] = {10, 9, 7};
+
+    display.fillScreen(color(10, 17, 33));
+    display.setTextColor(color(246, 249, 255));
+    drawFittedText(text("Hasło do sieci Wi-Fi",
+                        "Wi-Fi password",
+                        "Contraseña Wi-Fi",
+                        "WLAN-Passwort"),
+                   24, 2, 432, 24, readableUiSize(2.0f),
+                   lgfx::textdatum_t::middle_center);
+    display.setTextColor(wifiStatusMessage.isEmpty() ? color(174, 190, 215)
+                                                     : color(255, 205, 112));
+    drawFittedText(wifiStatusMessage.isEmpty() ? selectedWifiSsid
+                                               : wifiStatusMessage,
+                   22, 25, 436, 24, readableUiSize(1.6f),
+                   lgfx::textdatum_t::middle_center);
+
+    display.fillRoundRect(20, 51, 440, 35, 7, color(22, 32, 54));
+    display.drawRoundRect(20, 51, 440, 35, 7, color(75, 92, 121));
+    display.setTextColor(color(250, 252, 255));
+    String masked;
+    const size_t visiblePasswordLength =
+        wifiPasswordInput.length() < 36 ? wifiPasswordInput.length() : 36;
+    for (size_t index = 0; index < visiblePasswordLength; ++index) {
+        masked += '*';
+    }
+    drawFittedText(masked, 28, 53, 420, 31, 1.8f,
+                   lgfx::textdatum_t::middle_left);
+
+    for (int row = 0; row < 3; ++row) {
+        const char* keys = wifiKeyboardPage == 0
+                               ? letterRows[row]
+                               : wifiKeyboardPage == 1 ? numberRows[row]
+                                                       : symbolRows[row];
+        const int keyCount = wifiKeyboardPage == 0
+                                 ? letterLengths[row]
+                                 : static_cast<int>(strlen(keys));
+        const int start = wifiKeyboardPage == 0 ? letterStarts[row] : 20;
+        for (int index = 0; index < keyCount; ++index) {
+            String key(keys[index]);
+            if (wifiKeyboardPage == 0 && wifiPasswordLowercase) {
+                key.toLowerCase();
+            }
+            drawButton(start + index * 44, 98 + row * 40, 40, 36, key,
+                       color(39, 54, 82));
+        }
+    }
+    drawButton(15, 222, 78, 30,
+               wifiKeyboardPage == 0 ? "123"
+                                     : wifiKeyboardPage == 1 ? "SYM" : "ABC",
+               color(52, 73, 109));
+    drawButton(100, 222, 68, 30, "a/A", color(52, 73, 109));
+    drawButton(175, 222, 82, 30,
+               text("Spacja", "Space", "Espacio", "Leer"),
+               color(52, 73, 109));
+    drawButton(264, 222, 105, 30,
+               text("Usuń", "Delete", "Borrar", "Löschen"),
+               color(103, 47, 58));
+    drawButton(375, 222, 90, 30,
+               text("Wyczyść", "Clear", "Vaciar", "Leeren"),
+               color(103, 47, 58));
+    drawButton(25, 270, 200, 39,
+               wifiConnecting
+                   ? text("Łączenie...", "Connecting...", "Conectando...",
+                          "Verbinden...")
+                   : text("Połącz", "Connect", "Conectar", "Verbinden"),
+               wifiConnecting ? color(75, 92, 121) : color(25, 139, 103));
+    drawButton(255, 270, 200, 39,
+               text("Anuluj", "Cancel", "Cancelar", "Abbrechen"),
+               color(103, 47, 58));
+}
+
+void finishWifiScan(int networkCount) {
+    wifiScanInProgress = false;
+    wifiNetworks.clear();
+    if (networkCount < 0) {
+        WiFi.scanDelete();
+        wifiStatusMessage =
+            text("Skanowanie sieci nie powiodło się",
+                 "Network scan failed",
+                 "Error al buscar redes",
+                 "Netzwerksuche fehlgeschlagen");
+        return;
+    }
+    for (int index = 0; index < networkCount; ++index) {
+        const String ssid = WiFi.SSID(index);
+        if (ssid.isEmpty()) continue;
+        wifiNetworks.push_back(
+            {ssid, WiFi.RSSI(index), WiFi.encryptionType(index) == WIFI_AUTH_OPEN});
+    }
+    WiFi.scanDelete();
+    wifiStatusMessage = wifiNetworks.empty()
+                            ? text("Nie znaleziono widocznych sieci",
+                                   "No visible networks found",
+                                   "No se encontraron redes visibles",
+                                   "Keine sichtbaren Netzwerke gefunden")
+                            : "";
+}
+
+void beginWifiScan() {
+    WiFi.mode(WIFI_STA);
+    WiFi.scanDelete();
+    wifiNetworks.clear();
+    wifiNetworkScroll = 0;
+    wifiStatusMessage = text("Skanowanie sieci...",
+                             "Scanning for networks...",
+                             "Buscando redes...",
+                             "Netzwerke werden gesucht...");
+    const int result = WiFi.scanNetworks(true, true);
+    if (result == WIFI_SCAN_RUNNING) {
+        wifiScanInProgress = true;
+    } else {
+        finishWifiScan(result);
+    }
+}
+
+void restoreWifiAfterSetup() {
+    wifiConnecting = false;
+    wifiConnectionStartedAt = 0;
+    if (wifiScanInProgress) {
+        WiFi.scanDelete();
+        wifiScanInProgress = false;
+    }
+    if (wifiSetupRadioWasOn) {
+        WiFi.mode(WIFI_STA);
+        if (!config.ssid.isEmpty() &&
+            (WiFi.status() != WL_CONNECTED || WiFi.SSID() != config.ssid)) {
+            WiFi.disconnect(false);
+            WiFi.begin(config.ssid.c_str(), config.wifiPassword.c_str());
+        }
+    } else {
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+    }
+    wifiSetupActive = false;
+}
+
+void beginWifiConnection() {
+    if (selectedWifiSsid.isEmpty() || selectedWifiSsid.length() > 32 ||
+        wifiPasswordInput.length() > 63) {
+        wifiStatusMessage =
+            text("Nieprawidłowa nazwa sieci lub hasło",
+                 "Invalid network name or password",
+                 "Nombre de red o contraseña no válidos",
+                 "Ungültiger Netzwerkname oder Passwort");
+        drawWifiPassword();
+        return;
+    }
+    const bool selectedOpenNetwork = [&]() {
+        for (const WifiNetwork& network : wifiNetworks) {
+            if (network.ssid == selectedWifiSsid) return network.open;
+        }
+        return false;
+    }();
+    if (!selectedOpenNetwork && wifiPasswordInput.length() < 8) {
+        wifiStatusMessage =
+            text("Hasło musi mieć co najmniej 8 znaków",
+                 "Password must contain at least 8 characters",
+                 "La contraseña debe tener al menos 8 caracteres",
+                 "Das Passwort muss mindestens 8 Zeichen lang sein");
+        drawWifiPassword();
+        return;
+    }
+
+    WiFi.persistent(false);
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(selectedWifiSsid.c_str(), wifiPasswordInput.c_str());
+    wifiConnecting = true;
+    wifiConnectionStartedAt = millis();
+    wifiStatusMessage = text("Łączenie z siecią...",
+                             "Connecting to network...",
+                             "Conectando a la red...",
+                             "Verbindung wird hergestellt...");
+    drawWifiPassword();
+}
+
+void failWifiConnection(const char* messagePl, const char* messageEn,
+                        const char* messageEs, const char* messageDe) {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_STA);
+    if (wifiSetupRadioWasOn) {
+        if (!config.ssid.isEmpty()) {
+            WiFi.begin(config.ssid.c_str(), config.wifiPassword.c_str());
+        }
+    }
+    wifiConnecting = false;
+    wifiConnectionStartedAt = 0;
+    wifiStatusMessage = text(messagePl, messageEn, messageEs, messageDe);
+    drawWifiPassword();
+}
+
+void updateWifiProgress() {
+    if (screen == Screen::WifiSetup && wifiScanInProgress) {
+        const int result = WiFi.scanComplete();
+        if (result != WIFI_SCAN_RUNNING) {
+            finishWifiScan(result);
+            drawWifiSetup();
+        }
+    }
+    if (screen != Screen::WifiPassword || !wifiConnecting) return;
+    if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == selectedWifiSsid) {
+        const String previousSsid = config.ssid;
+        const String previousPassword = config.wifiPassword;
+        config.ssid = selectedWifiSsid;
+        config.wifiPassword = wifiPasswordInput;
+        if (!saveConfig()) {
+            config.ssid = previousSsid;
+            config.wifiPassword = previousPassword;
+            failWifiConnection(
+                "Połączono, ale nie zapisano konfiguracji na SD",
+                "Connected, but could not save configuration to SD",
+                "Conectado, pero no se pudo guardar en SD",
+                "Verbunden, Konfiguration konnte aber nicht auf SD gespeichert werden");
+            return;
+        }
+        configurationValid = true;
+        wifiConnecting = false;
+        wifiConnectionStartedAt = 0;
+        wifiSetupActive = false;
+        if (config.mode == Mode::Offline) {
+            WiFi.disconnect(true);
+            WiFi.mode(WIFI_OFF);
+        } else {
+            onlineEmployeesLoaded = false;
+            nextNetworkAttemptAt = millis();
+            nextEmployeeRefreshAt = 0;
+        }
+        lastMessage = text("Połączono i zapisano sieć",
+                           "Connected; network saved",
+                           "Conectado; red guardada",
+                           "Verbunden; Netzwerk gespeichert");
+        screen = Screen::Settings;
+        drawSettings();
+        return;
+    }
+    if (millis() - wifiConnectionStartedAt >= 20000) {
+        failWifiConnection(
+            "Nie udało się połączyć — sprawdź hasło",
+            "Connection failed — check the password",
+            "No se pudo conectar — compruebe la contraseña",
+            "Verbindung fehlgeschlagen — Passwort prüfen");
     }
 }
 
@@ -1563,25 +3270,27 @@ void drawEmployeeList() {
         const int y = 47 + static_cast<int>(row) * 50;
         const uint16_t panelColor = color(22, 32, 54);
         display.fillRoundRect(16, y, 420, 46, 8, panelColor);
-        setUiTextSize(1.4f);
         display.setTextColor(color(246, 249, 255));
-        display.drawString(employee.firstName + " " + employee.lastName, 25, y + 5);
+        drawFittedText(employee.firstName + " " + employee.lastName,
+                       25, y + 2, 218, 22, 1.4f,
+                       lgfx::textdatum_t::middle_left);
         display.setTextColor(color(174, 190, 215));
-        setUiTextSize(1.2f);
-        display.drawString("ID: " + employee.id, 25, y + 28);
-        drawButton(254, y + 5, 116, 36,
+        drawFittedText("ID: " + employee.id, 25, y + 23, 218, 19, 1.2f,
+                       lgfx::textdatum_t::middle_left);
+        drawButton(254, y + 3, 116, 40,
                    text("Przekaźnik", "Relay", "Relé", "Relais"),
                    employee.relayAccess ? color(25, 139, 103) : color(150, 48, 58));
-        drawButton(376, y + 5, 62, 36,
+        drawButton(376, y + 3, 62, 40,
                    text("Usuń", "Remove", "Borrar", "Löschen"),
                    color(103, 47, 58));
     }
-    drawVerticalScrollbar(462, 48, 196, count, kRowsPerPage,
+    drawVerticalScrollbar(450, 48, 196, count, kRowsPerPage,
                           employeeListPage * kRowsPerPage);
     if (!lastMessage.isEmpty()) {
-        setUiTextSize(0.8f);
-        display.setTextColor(color(255, 191, 87));
-        display.drawCenterString(lastMessage, 240, 252);
+        display.setTextColor(color(255, 205, 112));
+        drawFittedText(lastMessage, 20, 248, 420, 17,
+                       readableUiSize(1.5f),
+                       lgfx::textdatum_t::middle_center);
     }
 
     drawButton(16, 267, 214, 43,
@@ -1597,18 +3306,26 @@ void drawEmployeeList() {
 void drawAddEmployeeCard() {
     display.fillScreen(color(10, 17, 33));
     display.setTextColor(color(246, 249, 255));
-    setUiTextSize(2);
-    display.drawCenterString(text("Dodawanie pracownika",
-                                  "Add employee", "Añadir empleado",
-                                  "Mitarbeiter hinzufügen"),
-                             240, 72);
-    display.setTextColor(color(174, 190, 215));
-    setUiTextSize(1.4f);
-    display.drawCenterString(text("Przyłóż nową kartę",
-                                  "Scan the new card",
-                                  "Acerque la nueva tarjeta",
-                                  "Neue Karte vorhalten"),
-                             240, 145);
+    drawFittedText(text("Dodawanie pracownika",
+                        "Add employee", "Añadir empleado",
+                        "Mitarbeiter hinzufügen"),
+                   24, 48, 432, 44, readableUiSize(2.0f),
+                   lgfx::textdatum_t::middle_center);
+    if (lastMessage.isEmpty()) {
+        display.setTextColor(color(174, 190, 215));
+        drawFittedText(text("Przyłóż nową kartę",
+                            "Scan the new card",
+                            "Acerque la nueva tarjeta",
+                            "Neue Karte vorhalten"),
+                            24, 112, 432, 54, readableUiSize(1.8f),
+                       lgfx::textdatum_t::middle_center);
+    } else {
+        display.fillRoundRect(20, 166, 440, 64, 10, color(104, 35, 45));
+        display.setTextColor(color(255, 239, 240));
+        drawFittedText(lastMessage, 32, 170, 416, 56,
+                       readableUiSize(2.0f),
+                       lgfx::textdatum_t::middle_center);
+    }
     drawButton(170, 250, 140, 48,
                text("Anuluj", "Cancel", "Cancelar", "Abbrechen"),
                color(103, 47, 58));
@@ -1686,11 +3403,26 @@ bool loadTouchCalibration() {
     if (!preferences.isKey("touch_v1") ||
         preferences.getBytes("touch_v1", &candidate,
                              sizeof(candidate)) != sizeof(candidate) ||
-        candidate.magic != kTouchCalibrationMagic) {
+        (candidate.magic != kTouchCalibrationMagic &&
+         candidate.magic != kLegacyTouchCalibrationMagic)) {
         return false;
     }
     for (int i = 0; i < 3; ++i) {
         if (!isfinite(candidate.x[i]) || !isfinite(candidate.y[i])) {
+            return false;
+        }
+    }
+    if (candidate.magic == kLegacyTouchCalibrationMagic) {
+        candidate.x[0] = -candidate.x[0];
+        candidate.x[1] = -candidate.x[1];
+        candidate.x[2] = static_cast<float>(kScreenWidth - 1) - candidate.x[2];
+        candidate.y[0] = -candidate.y[0];
+        candidate.y[1] = -candidate.y[1];
+        candidate.y[2] = static_cast<float>(kScreenHeight - 1) - candidate.y[2];
+        candidate.magic = kTouchCalibrationMagic;
+        if (preferences.putBytes("touch_v1", &candidate, sizeof(candidate)) !=
+            sizeof(candidate)) {
+            Serial.println("Could not migrate touch calibration for 180-degree display rotation");
             return false;
         }
     }
@@ -1855,7 +3587,29 @@ Employee* findEmployee(const String& uid) {
     return nullptr;
 }
 
+void finishEmployeeRegistration(const Employee& employee) {
+    for (size_t index = employees.size(); index > 0; --index) {
+        const Employee& existing = employees[index - 1];
+        if (existing.id.equalsIgnoreCase(employee.id) ||
+            existing.uid.equalsIgnoreCase(employee.uid)) {
+            employees.erase(employees.begin() + index - 1);
+        }
+    }
+    employees.push_back(employee);
+    if (config.mode == Mode::Online) onlineEmployeesLoaded = true;
+    addLog("INFO", "EMPLOYEE_REGISTERED", employee.id + ":" + employee.uid);
+    lastMessage = text("Dodano: ", "Added: ", "Añadido: ", "Hinzugefügt: ") +
+                  employee.firstName + " " + employee.lastName;
+    const bool returnToList = employeeManagementReturnToList;
+    employeeManagementReturnToList = false;
+    pendingEmployeeUid = "";
+    screen = returnToList ? Screen::EmployeeList : Screen::Home;
+    if (returnToList) drawEmployeeList();
+    else drawHome();
+}
+
 bool saveNewEmployee() {
+    if (pendingEmployeeRegistrationRequestId != 0) return false;
     newEmployeeId.trim();
     newEmployeeFirstName.trim();
     newEmployeeLastName.trim();
@@ -1877,18 +3631,42 @@ bool saveNewEmployee() {
         drawEmployeeEnrollment();
         return false;
     }
-    for (const auto& existing : employees) {
-        if (existing.id.equalsIgnoreCase(newEmployeeId) ||
-            existing.uid.equalsIgnoreCase(pendingEmployeeUid)) {
-            lastMessage = text("ID lub karta już istnieje",
-                               "ID or card already exists",
-                               "El ID o la tarjeta ya existe",
-                               "ID oder Karte bereits vorhanden");
+
+    if (config.mode == Mode::Offline) {
+        const auto previousEmployees = employees;
+        const auto previousAttendanceStates = offlineAttendanceStates;
+        const bool previousOfflineLoaded = offlineEmployeesLoaded;
+        if (!loadEmployeesFromCsv()) {
+            employees = previousEmployees;
+            offlineAttendanceStates = previousAttendanceStates;
+            offlineEmployeesLoaded = previousOfflineLoaded;
+            lastMessage = text("Nie można odświeżyć employees.csv z karty SD",
+                               "Could not refresh employees.csv from SD card",
+                               "No se pudo actualizar employees.csv desde SD",
+                               "employees.csv konnte nicht von SD geladen werden");
             drawEmployeeEnrollment();
             return false;
         }
+        for (const auto& existing : employees) {
+            if (existing.id.equalsIgnoreCase(newEmployeeId)) {
+                lastMessage = text("To ID jest już przypisane do pracownika",
+                                   "This ID is already assigned to an employee",
+                                   "Este ID ya está asignado a un empleado",
+                                   "Diese ID ist bereits einem Mitarbeiter zugeordnet");
+                drawEmployeeEnrollment();
+                return false;
+            }
+            if (existing.uid.equalsIgnoreCase(pendingEmployeeUid)) {
+                lastMessage = text("Ta karta jest już przypisana do pracownika",
+                                   "This card is already assigned to an employee",
+                                   "Esta tarjeta ya está asignada a un empleado",
+                                   "Diese Karte ist bereits einem Mitarbeiter zugeordnet");
+                drawEmployeeEnrollment();
+                return false;
+            }
+        }
     }
-    if (employees.size() >= kMaximumEmployees) {
+    if (config.mode == Mode::Offline && employees.size() >= kMaximumEmployees) {
         lastMessage = text("Osiągnięto limit pracowników",
                            "Employee limit reached",
                            "Límite de empleados alcanzado",
@@ -1915,14 +3693,29 @@ bool saveNewEmployee() {
         row["last_name"] = employee.lastName;
         row["active"] = true;
         row["relay_access"] = employee.relayAccess;
-        if (!postToAppsScript(request)) {
-            lastMessage = text("Błąd zapisu w arkuszu Google",
-                               "Could not save to Google Sheets",
-                               "No se pudo guardar en Google Sheets",
-                               "Speichern in Google Sheets fehlgeschlagen");
+        pendingEmployeeRegistration = employee;
+        pendingEmployeeRegistrationRequestId = nextNetworkRequestId();
+        employeeRegistrationRequestStartedAt = millis();
+        String serializedRequest;
+        if (!enqueueAsyncAppsScriptRequest(request,
+                                           pendingEmployeeRegistrationRequestId,
+                                           serializedRequest)) {
+            pendingEmployeeRegistrationRequestId = 0;
+            employeeRegistrationRequestStartedAt = 0;
+            pendingEmployeeRegistration = Employee{};
+            lastMessage = text("Nie można wysłać pracownika do API",
+                               "Could not queue employee registration",
+                               "No se pudo enviar el registro",
+                               "Mitarbeiterregistrierung konnte nicht gesendet werden");
             drawEmployeeEnrollment();
             return false;
         }
+        lastMessage = text("Zapisywanie pracownika...",
+                           "Saving employee...",
+                           "Guardando empleado...",
+                           "Mitarbeiter wird gespeichert...");
+        drawEmployeeEnrollment();
+        return true;
     } else {
         if (!sdAvailable || !offlineEmployeesLoaded) {
             lastMessage = text("Brak gotowego pliku employees.csv",
@@ -1993,21 +3786,28 @@ bool saveNewEmployee() {
         SD.remove(backupPath);
     }
 
-    employees.push_back(employee);
-    if (config.mode == Mode::Online) onlineEmployeesLoaded = true;
-    addLog("INFO", "EMPLOYEE_REGISTERED", employee.id + ":" + employee.uid);
-    lastMessage = text("Dodano: ", "Added: ", "Añadido: ", "Hinzugefügt: ") +
-                  employee.firstName + " " + employee.lastName;
-    const bool returnToList = employeeManagementReturnToList;
-    employeeManagementReturnToList = false;
-    pendingEmployeeUid = "";
-    screen = returnToList ? Screen::EmployeeList : Screen::Home;
-    if (returnToList) drawEmployeeList();
-    else drawHome();
+    finishEmployeeRegistration(employee);
     return true;
 }
 
 void handleCard() {
+    if (config.mode == Mode::Online &&
+        (!onlineEmployeesLoaded || !pendingOnlineEventId.isEmpty())) return;
+    if (config.mode == Mode::Online && WiFi.status() == WL_CONNECTED &&
+        hasPendingOnlineAttendance()) {
+        lastMessage = text("Wysyłanie tymczasowych odbić — poczekaj",
+                           "Syncing temporary punches — please wait",
+                           "Enviando registros — espere",
+                           "Temporäre Buchungen werden gesendet — bitte warten");
+        if (pendingQueueSyncFailed) {
+            lastMessage = text("Odbicia oczekują na wysłanie — sprawdź połączenie",
+                               "Punches are pending — check the connection",
+                               "Registros pendientes — revise la conexión",
+                               "Buchungen warten — Verbindung prüfen");
+        }
+        if (screen == Screen::Home) drawHome();
+        return;
+    }
     if (!rfidAvailable || !rfid.PICC_IsNewCardPresent() ||
         !rfid.PICC_ReadCardSerial()) return;
     String uid;
@@ -2035,19 +3835,33 @@ void handleCard() {
         return;
     }
 
-    Employee* employee = findEmployee(uid);
     if (screen == Screen::AddEmployeeCard) {
+        if (config.mode == Mode::Offline) {
+            const auto previousEmployees = employees;
+            const auto previousAttendanceStates = offlineAttendanceStates;
+            const bool previousOfflineLoaded = offlineEmployeesLoaded;
+            if (!loadEmployeesFromCsv()) {
+                employees = previousEmployees;
+                offlineAttendanceStates = previousAttendanceStates;
+                offlineEmployeesLoaded = previousOfflineLoaded;
+                lastMessage = text("Nie można odświeżyć employees.csv z karty SD",
+                                   "Could not refresh employees.csv from SD card",
+                                   "No se pudo actualizar employees.csv desde SD",
+                                   "employees.csv konnte nicht von SD geladen werden");
+                drawAddEmployeeCard();
+                return;
+            }
+        }
+        Employee* employee = config.mode == Mode::Online ? nullptr : findEmployee(uid);
         if (employee != nullptr) {
-            lastMessage = text("Ta karta jest już przypisana",
-                               "This card is already assigned",
-                               "Esta tarjeta ya está asignada",
-                               "Diese Karte ist bereits zugeordnet");
+            lastMessage = text("Ta karta jest już przypisana do pracownika",
+                               "This card is already assigned to an employee",
+                               "Esta tarjeta ya está asignada a un empleado",
+                               "Diese Karte ist bereits einem Mitarbeiter zugeordnet");
             drawAddEmployeeCard();
-            display.setTextColor(color(255, 191, 87));
-            setUiTextSize(0.9f);
-            display.drawCenterString(lastMessage, 240, 205);
             return;
         }
+        lastMessage = "";
         pendingEmployeeUid = uid;
         employeeEnrollmentRequested = true;
         pinInput = "";
@@ -2056,6 +3870,7 @@ void handleCard() {
         drawPinEntry();
         return;
     }
+    Employee* employee = findEmployee(uid);
     if (employee == nullptr) {
         pendingEmployeeUid = uid;
         employeeEnrollmentRequested = false;
@@ -2075,7 +3890,34 @@ void handleCard() {
         return;
     }
     selectedEmployee = *employee;
+    if (config.mode == Mode::Online && WiFi.status() != WL_CONNECTED) {
+        outageActionChoice = true;
+        screen = Screen::ActionChoice;
+        drawActionChoice();
+        return;
+    }
     if (employee->relayAccess) {
+        if (config.mode == Mode::Online) {
+            if (!queueOnlineAttendanceState(selectedEmployee)) {
+                lastMessage = text("Nie można sprawdzić statusu obecności",
+                                   "Could not check attendance status",
+                                   "No se pudo comprobar la asistencia",
+                                   "Anwesenheitsstatus konnte nicht geprüft werden");
+                screen = Screen::Home;
+                drawHome();
+            }
+            return;
+        }
+        if (!sdAvailable || !offlineEmployeesLoaded) {
+            lastMessage = text("Brak danych obecności na karcie SD",
+                               "Attendance data unavailable on SD card",
+                               "Datos de asistencia no disponibles en SD",
+                               "Anwesenheitsdaten auf SD nicht verfügbar");
+            drawHome();
+            return;
+        }
+        selectedEmployeePresent =
+            lastOfflineAttendance(employee->id) == "ENTRY";
         screen = Screen::ActionChoice;
         drawActionChoice();
         return;
@@ -2083,19 +3925,19 @@ void handleCard() {
 
     if (config.mode == Mode::Online) {
         processAttendance(AttendanceAction::Entry, true);
-    } else {
-        String previous;
-        if (!previousAttendance(employee->id, previous)) {
-            lastMessage = text("Brak karty SD — odbicie anulowane",
-                               "SD unavailable — punch rejected",
-                               "SD no disponible — registro rechazado",
-                               "SD-Karte fehlt — Buchung abgelehnt");
-            drawHome();
-            return;
-        }
-        processAttendance(previous == "ENTRY" ? AttendanceAction::Exit
-                                              : AttendanceAction::Entry);
+        return;
     }
+    if (!sdAvailable || !offlineEmployeesLoaded) {
+        lastMessage = text("Brak karty SD — odbicie anulowane",
+                           "SD unavailable — punch rejected",
+                           "SD no disponible — registro rechazado",
+                           "SD-Karte fehlt — Buchung abgelehnt");
+        drawHome();
+        return;
+    }
+    const String previous = lastOfflineAttendance(employee->id);
+    processAttendance(previous == "ENTRY" ? AttendanceAction::Exit
+                                          : AttendanceAction::Entry);
 }
 
 void handlePinTouch(int32_t x, int32_t y) {
@@ -2175,6 +4017,7 @@ void handlePinTouch(int32_t x, int32_t y) {
 }
 
 void handleEmployeeEnrollmentTouch(int32_t x, int32_t y) {
+    if (pendingEmployeeRegistrationRequestId != 0) return;
     if (y >= 298) {
         if (x >= 65 && x < 215) {
             saveNewEmployee();
@@ -2188,21 +4031,24 @@ void handleEmployeeEnrollmentTouch(int32_t x, int32_t y) {
         }
         return;
     }
-    if (y >= 48 && y < 144) {
-        enrollmentField = static_cast<uint8_t>((y - 48) / 32);
+    if (y >= 78 && y < 159) {
+        lastMessage = "";
+        enrollmentField = static_cast<uint8_t>((y - 78) / 27);
         enrollmentLowercase = enrollmentField != 0;
         screenSince = millis();
         drawEmployeeEnrollment();
         return;
     }
-    if (y >= 150 && y < 175) {
+    if (y >= 161 && y < 184) {
+        lastMessage = "";
         newEmployeeRelayAccess = !newEmployeeRelayAccess;
         screenSince = millis();
         drawEmployeeEnrollment();
         return;
     }
-    if (y >= 179 && y < 272) {
-        const int row = (y - 179) / 33;
+    if (y >= 184 && y < 271) {
+        lastMessage = "";
+        const int row = (y - 184) / 30;
         if (row < 0 || row > 2) return;
         const int rowStarts[] = {20, 42, 86};
         const int rowLengths[] = {10, 9, 7};
@@ -2224,7 +4070,8 @@ void handleEmployeeEnrollmentTouch(int32_t x, int32_t y) {
         drawEmployeeEnrollment();
         return;
     }
-    if (y >= 275 && y < 296) {
+    if (y >= 273 && y < 296) {
+        lastMessage = "";
         String* value = enrollmentFieldValue(enrollmentField);
         if (x < 90) {
             enrollmentNumericKeyboard = !enrollmentNumericKeyboard;
@@ -2268,21 +4115,11 @@ void switchMode() {
         WiFi.persistent(false);
         WiFi.mode(WIFI_STA);
         WiFi.begin(config.ssid.c_str(), config.wifiPassword.c_str());
-        const uint32_t startedAt = millis();
-        while (WiFi.status() != WL_CONNECTED && millis() - startedAt < 10000) {
-            delay(100);
-        }
-        if (WiFi.status() == WL_CONNECTED && loadEmployeesFromOnlineSheet()) {
-            nextEmployeeRefreshAt = millis() + kEmployeeRefreshMs;
-            lastMessage = text("Tryb online", "Online mode", "Modo en línea",
-                               "Online-Modus");
-        } else {
-            lastMessage = text("Brak API — tryb online nieaktywny",
-                               "API unavailable — online mode inactive",
-                               "API no disponible — modo inactivo",
-                               "API nicht erreichbar — Online-Modus inaktiv");
-            addLog("ERROR", "ONLINE_MODE_UNAVAILABLE", "");
-        }
+        nextNetworkAttemptAt = millis();
+        lastMessage = text("Łączenie z trybem online...",
+                           "Connecting to online service...",
+                           "Conectando al servicio en línea...",
+                           "Verbindung zum Online-Dienst...");
     }
 }
 
@@ -2373,7 +4210,7 @@ void handleTouch() {
     if (touchWasDown) return;
     touchWasDown = true;
     if (screen == Screen::Home) {
-        if (x >= 350 && y >= 260) {
+        if (x >= 340 && x < 460 && y >= 270 && y < 306) {
             screen = Screen::PinEntry;
             pinInput = "";
             screenSince = millis();
@@ -2394,38 +4231,179 @@ void handleTouch() {
             drawHome();
         }
     } else if (screen == Screen::ActionChoice) {
-        if (y >= 108 && y < 190 && x < 240) {
+        if (outageActionChoice) {
+            if (y >= 154 && y < 226 && x >= 25 && x < 230) {
+                processAttendance(AttendanceAction::Entry);
+            } else if (y >= 154 && y < 226 && x >= 250 && x < 455) {
+                processAttendance(AttendanceAction::Exit);
+            } else if (selectedEmployee.relayAccess &&
+                       y >= 236 && y < 290 && x >= 115 && x < 365) {
+                outageActionChoice = false;
+                setRelay(true);
+                lastMessage = text("Drzwi odblokowane — brak połączenia",
+                                   "Door unlocked — no connection",
+                                   "Puerta abierta — sin conexión",
+                                   "Tür geöffnet — keine Verbindung");
+                screen = Screen::Home;
+                drawHome();
+            }
+        } else if (selectedEmployeePresent) {
+            if (y >= 132 && y < 224 && x >= 30 && x < 230) {
+                processAttendance(AttendanceAction::Exit);
+            } else if (y >= 132 && y < 224 && x >= 250 && x < 450) {
+                setRelay(true);
+                lastMessage = text("Drzwi odblokowane", "Door unlocked",
+                                   "Puerta desbloqueada", "Tür entriegelt");
+                screen = Screen::Home;
+                drawHome();
+            }
+        } else if (y >= 132 && y < 224 && x >= 70 && x < 410) {
             processAttendance(AttendanceAction::Entry);
-        } else if (y >= 108 && y < 190 && x >= 240) {
-            processAttendance(AttendanceAction::Exit);
-        } else if (y >= 204 && y < 282) {
-            setRelay(true);
-            lastMessage = text("Drzwi odblokowane", "Door unlocked",
-                               "Puerta desbloqueada", "Tür entriegelt");
-            screen = Screen::Home;
-            drawHome();
         }
     } else if (screen == Screen::PinEntry || screen == Screen::PinChange ||
                screen == Screen::PinConfirm) {
         handlePinTouch(x, y);
     } else if (screen == Screen::EmployeeEnroll) {
         handleEmployeeEnrollmentTouch(x, y);
+    } else if (screen == Screen::WifiSetup) {
+        constexpr int kWifiScrollHeight =
+            kVisibleWifiNetworks * kWifiNetworkRowHeight - 4;
+        if (y >= 277 && x >= 255 && x < 450) {
+            restoreWifiAfterSetup();
+            wifiStatusMessage = "";
+            screen = Screen::Settings;
+            lastMessage = "";
+            drawSettings();
+            return;
+        }
+        if (x >= 448 && x < 476 && y >= kWifiNetworkRowY &&
+            y < kWifiNetworkRowY + kWifiScrollHeight) {
+            wifiNetworkScroll = scrollbarOffsetForTouch(
+                y, kWifiNetworkRowY, kWifiScrollHeight, wifiNetworks.size(),
+                kVisibleWifiNetworks, wifiNetworkScroll);
+            drawWifiSetup();
+            return;
+        }
+        if (y >= 277 && x >= 30 && x < 225) {
+            beginWifiScan();
+            drawWifiSetup();
+            return;
+        }
+        if (x >= 115 && x < 365 && y >= kWifiNetworkRowY &&
+            y < kWifiNetworkRowY +
+                    kVisibleWifiNetworks * kWifiNetworkRowHeight) {
+            const size_t row =
+                static_cast<size_t>((y - kWifiNetworkRowY) /
+                                    kWifiNetworkRowHeight);
+            const size_t networkIndex = wifiNetworkScroll + row;
+            if (networkIndex < wifiNetworks.size()) {
+                selectedWifiSsid = wifiNetworks[networkIndex].ssid;
+                wifiPasswordInput =
+                    !wifiNetworks[networkIndex].open &&
+                            selectedWifiSsid == config.ssid
+                        ? config.wifiPassword
+                        : "";
+                wifiPasswordLowercase = false;
+                wifiKeyboardPage = 0;
+                wifiStatusMessage = "";
+                screen = Screen::WifiPassword;
+                drawWifiPassword();
+            }
+        }
+    } else if (screen == Screen::WifiPassword) {
+        static constexpr const char* letterRows[] = {
+            "QWERTYUIOP", "ASDFGHJKL", "ZXCVBNM"
+        };
+        static constexpr const char* numberRows[] = {
+            "1234567890", "!@#$%^&*()", "-_=+[]{};:"
+        };
+        static constexpr const char* symbolRows[] = {
+            ".,/?<>\\|~`", "'\"();:{}[]", "+-_*&^%$#@"
+        };
+        static constexpr int letterStarts[] = {20, 42, 86};
+        static constexpr int letterLengths[] = {10, 9, 7};
+        if (y >= 270 && x >= 255 && x < 455) {
+            if (wifiConnecting) {
+                WiFi.disconnect(true);
+                WiFi.mode(WIFI_STA);
+                if (wifiSetupRadioWasOn && !config.ssid.isEmpty()) {
+                    WiFi.begin(config.ssid.c_str(), config.wifiPassword.c_str());
+                }
+                wifiConnecting = false;
+                wifiConnectionStartedAt = 0;
+            }
+            screen = Screen::WifiSetup;
+            wifiStatusMessage = "";
+            drawWifiSetup();
+            return;
+        }
+        if (y >= 270 && x >= 25 && x < 225) {
+            if (!wifiConnecting) beginWifiConnection();
+            return;
+        }
+        if (y >= 98 && y < 218 && !wifiConnecting) {
+            const int row = (y - 98) / 40;
+            if (row < 0 || row >= 3) return;
+            const char* keys = wifiKeyboardPage == 0
+                                   ? letterRows[row]
+                                   : wifiKeyboardPage == 1 ? numberRows[row]
+                                                           : symbolRows[row];
+            const int keyCount = wifiKeyboardPage == 0
+                                     ? letterLengths[row]
+                                     : static_cast<int>(strlen(keys));
+            const int start = wifiKeyboardPage == 0 ? letterStarts[row] : 20;
+            const int keyIndex = (x - start) / 44;
+            if (x < start || keyIndex < 0 || keyIndex >= keyCount ||
+                (x - start) % 44 >= 40) {
+                return;
+            }
+            if (wifiPasswordInput.length() < 63) {
+                String key(keys[keyIndex]);
+                if (wifiKeyboardPage == 0 && wifiPasswordLowercase) {
+                    key.toLowerCase();
+                }
+                wifiPasswordInput += key;
+            }
+            drawWifiPassword();
+            return;
+        }
+        if (y >= 222 && y < 252 && !wifiConnecting) {
+            if (x >= 15 && x < 93) {
+                wifiKeyboardPage = (wifiKeyboardPage + 1) % 3;
+            } else if (x >= 100 && x < 168 && wifiKeyboardPage == 0) {
+                wifiPasswordLowercase = !wifiPasswordLowercase;
+            } else if (x >= 175 && x < 257 &&
+                       wifiPasswordInput.length() < 63) {
+                wifiPasswordInput += ' ';
+            } else if (x >= 264 && x < 370) {
+                removeLastInputCharacter(wifiPasswordInput);
+            } else if (x >= 375 && x < 465) {
+                wifiPasswordInput = "";
+            }
+            drawWifiPassword();
+        }
     } else if (screen == Screen::Settings) {
-        if (y >= 274 && x >= 170 && x < 310) {
+        if (y >= 280 && x >= 115 && x < 365) {
             employeeManagementReturnToList = false;
             screen = Screen::Home;
             drawHome();
             return;
         }
-        if (x >= 440 && y >= 49 && y < 264) {
-            settingsScroll = static_cast<uint8_t>(
-                (static_cast<uint32_t>(y - 49) * 3) / 213);
+        constexpr int kSettingsScrollHeight =
+            kVisibleSettings * kSettingsRowHeight - 4;
+        if (x >= 448 && x < 476 && y >= kSettingsRowY &&
+            y < kSettingsRowY + kSettingsScrollHeight) {
+            settingsScroll = static_cast<uint8_t>(scrollbarOffsetForTouch(
+                y, kSettingsRowY, kSettingsScrollHeight, kTotalSettings,
+                kVisibleSettings, settingsScroll));
             drawSettings();
             return;
         }
-        if (y >= 49 && y < 264) {
+        if (x >= 20 && x < 420 && y >= kSettingsRowY &&
+            y < kSettingsRowY + kVisibleSettings * kSettingsRowHeight) {
             const size_t settingIndex =
-                settingsScroll + static_cast<size_t>((y - 49) / 43);
+                settingsScroll +
+                static_cast<size_t>((y - kSettingsRowY) / kSettingsRowHeight);
             switch (settingIndex) {
                 case 0:
                     config.language = static_cast<Language>(
@@ -2441,7 +4419,7 @@ void handleTouch() {
                     break;
                 case 3:
                     uiFont = static_cast<UiFont>(
-                        (static_cast<uint8_t>(uiFont) + 1) % 4);
+                        (static_cast<uint8_t>(uiFont) + 1) % kUiFontCount);
                     applyUiFont();
                     if (preferences.putUChar("font",
                                              static_cast<uint8_t>(uiFont)) == 0) {
@@ -2460,26 +4438,71 @@ void handleTouch() {
                     }
                     break;
                 case 4:
+                    if (preferences.putBool("invert", !displayInverted) == 0) {
+                        lastMessage =
+                            text("Nie zapisano trybu kolorów",
+                                 "Could not save color mode",
+                                 "No se pudo guardar el modo de color",
+                                 "Farbmodus konnte nicht gespeichert werden");
+                        break;
+                    }
+                    displayInverted = !displayInverted;
+                    display.invertDisplay(displayInverted);
+                    lastMessage = "";
+                    break;
+                case 5:
                     employeeListPage = 0;
                     lastMessage = "";
                     screen = Screen::EmployeeList;
                     drawEmployeeList();
                     return;
-                case 5:
+                case 6:
                     screen = Screen::ClockSet;
                     drawClockSettings();
                     return;
-                case 6:
+                case 7:
                     screen = Screen::PinChange;
                     pinInput = "";
                     screenSince = millis();
                     drawPinEntry();
                     return;
-                case 7:
+                case 8:
                     runTouchCalibration();
                     screen = Screen::Settings;
                     drawSettings();
                     return;
+                case 9:
+                    wifiSetupRadioWasOn = WiFi.getMode() != WIFI_OFF;
+                    wifiStatusMessage = "";
+                    wifiNetworks.clear();
+                    wifiNetworkScroll = 0;
+                    wifiSetupActive = true;
+                    beginWifiScan();
+                    screen = Screen::WifiSetup;
+                    drawWifiSetup();
+                    return;
+                case 10: {
+                    if (!wallpaperEnabled && wallpaperPixels == nullptr &&
+                        !loadWallpaper()) {
+                        lastMessage = text("Brak poprawnego pliku WALLPAPER.RGB565",
+                                           "WALLPAPER.RGB565 is missing or invalid",
+                                           "WALLPAPER.RGB565 falta o no es válido",
+                                           "WALLPAPER.RGB565 fehlt oder ist ungültig");
+                        break;
+                    }
+                    const bool enabled = !wallpaperEnabled;
+                    if (preferences.putBool("wallpaper", enabled) == 0) {
+                        lastMessage = text("Nie zapisano ustawienia tapety",
+                                           "Could not save wallpaper setting",
+                                           "No se pudo guardar el fondo",
+                                           "Hintergrund-Einstellung konnte nicht "
+                                           "gespeichert werden");
+                        break;
+                    }
+                    wallpaperEnabled = enabled;
+                    lastMessage = "";
+                    break;
+                }
                 default:
                     return;
             }
@@ -2492,9 +4515,9 @@ void handleTouch() {
             (count + kRowsPerPage - 1) / kRowsPerPage > 0
                 ? (count + kRowsPerPage - 1) / kRowsPerPage
                 : 1;
-        if (x >= 438 && y >= 48 && y < 244) {
-            employeeListPage = static_cast<uint16_t>(
-                (static_cast<uint32_t>(y - 48) * (pageCount - 1)) / 195);
+        if (x >= 448 && x < 476 && y >= 48 && y < 244) {
+            employeeListPage = static_cast<uint16_t>(scrollbarOffsetForTouch(
+                y, 48, 196, count, kRowsPerPage, employeeListPage));
         } else if (y >= 47 && y < 247) {
             const size_t row = static_cast<size_t>((y - 47) / 50);
             const int employeeIndex =
@@ -2554,7 +4577,7 @@ bool initDisplay() {
     if (!display.init()) return false;
     display.setColorDepth(16);
     applyUiFont();
-    display.setRotation(1);
+    display.setRotation(3);
     display.fillScreen(color(10, 17, 33));
     display.setTextColor(color(245, 248, 255));
     setUiTextSize(3);
@@ -2573,11 +4596,24 @@ void setupRcp() {
     }
 
     preferences.begin("rcp", false);
+    networkWorkerReady = initializeNetworkWorker();
     storedPin = preferences.getString("pin", "0000");
+    pendingOnlineEventId = preferences.getString("pending_event", "");
+    pendingOnlineEmployeeId = preferences.getString("pend_emp", "");
+    pendingOnlineEmployeeName = preferences.getString("pending_name", "");
+    pendingAttendanceRequestBody = preferences.getString("pending_payload", "");
+    if (pendingOnlineEventId.isEmpty()) {
+        preferences.remove("pend_emp");
+        preferences.remove("pending_name");
+        preferences.remove("pending_payload");
+    }
     const bool savedLanguage = preferences.isKey("language");
     const bool savedCamera = preferences.isKey("camera");
+    displayInverted = preferences.getBool("invert", false);
+    wallpaperEnabled = preferences.getBool("wallpaper", true);
+    if (displayReady) display.invertDisplay(displayInverted);
     const uint8_t savedFont = preferences.getUChar("font", 0);
-    if (savedFont <= static_cast<uint8_t>(UiFont::FreeMono)) {
+    if (savedFont < kUiFontCount) {
         uiFont = static_cast<UiFont>(savedFont);
     } else {
         preferences.remove("font");
@@ -2609,6 +4645,7 @@ void setupRcp() {
     sdBus.begin(pins::tft_sck, pins::tft_miso, pins::tft_mosi, pins::sd_cs);
     sdAvailable = SD.begin(pins::sd_cs, sdBus, 20000000);
     if (sdAvailable) {
+        loadWallpaper();
         const bool employeesFileReady = ensureCsvFile(
             kEmployeesPath,
             "employee_id,card_uid,first_name,last_name,active,relay_access");
@@ -2617,6 +4654,11 @@ void setupRcp() {
             "event_id,timestamp,employee_id,card_uid,event_type,photo_file,source,notes");
         const bool logsFileReady = ensureCsvFile(
             kLogsPath, "event_id,timestamp,level,code,message");
+        const bool pendingAttendanceFileReady =
+            ensureCsvFile(kPendingAttendancePath, kAttendanceHeader);
+        if (!pendingAttendanceFileReady) {
+            Serial.println("Could not initialize temporary online attendance queue");
+        }
         sdFilesInitialized = employeesFileReady && attendanceFileReady && logsFileReady;
 
         if (!SD.exists(kConfigPath)) {
@@ -2670,24 +4712,14 @@ void setupRcp() {
         WiFi.persistent(false);
         WiFi.mode(WIFI_STA);
         WiFi.begin(config.ssid.c_str(), config.wifiPassword.c_str());
-        const uint32_t startedAt = millis();
-        while (WiFi.status() != WL_CONNECTED && millis() - startedAt < 10000) {
-            delay(100);
-        }
-        if (WiFi.status() != WL_CONNECTED) {
-            addLog("ERROR", "WIFI_CONNECT_FAILED", WiFi.SSID());
-        } else if (!loadEmployeesFromOnlineSheet()) {
-            addLog("ERROR", "EMPLOYEE_SYNC_FAILED", "Could not load employees");
-        } else {
-            nextEmployeeRefreshAt = millis() + kEmployeeRefreshMs;
-        }
+        nextNetworkAttemptAt = millis();
     } else if (configurationValid && config.mode == Mode::Offline) {
         loadEmployeesFromCsv();
     }
 
-    digitalWrite(pins::buzzer, HIGH);
-    delay(70);
-    digitalWrite(pins::buzzer, LOW);
+    tone(pins::buzzer, 2500, 300);
+    delay(300);
+    noTone(pins::buzzer);
     if (!configurationValid) {
         lastMessage = text("Brak poprawnej konfiguracji SD",
                            "Invalid or missing SD configuration",
@@ -2712,11 +4744,26 @@ void setupRcp() {
                            "Missing or invalid employees.csv",
                            "employees.csv ausente o inválido",
                            "employees.csv fehlt oder ungültig");
+    } else if (config.mode == Mode::Online && !pendingOnlineEventId.isEmpty()) {
+        lastMessage = text("Wynik odbicia nieznany — trwa weryfikacja",
+                           "Punch result unknown — checking",
+                           "Resultado desconocido — verificando",
+                           "Buchung unbekannt — Prüfung läuft");
+    } else if (config.mode == Mode::Online && !networkWorkerReady) {
+        lastMessage = text("Błąd zadania sieciowego — uruchom ponownie",
+                           "Network task unavailable — restart device",
+                           "Tarea de red no disponible — reinicie",
+                           "Netzwerkaufgabe nicht verfügbar — neu starten");
     } else if (config.mode == Mode::Online && WiFi.status() != WL_CONNECTED) {
-        lastMessage = text("Brak połączenia online — tryb bez przełączenia",
-                           "Online unavailable — no offline fallback",
-                           "Servicio en línea no disponible",
-                           "Online-Dienst nicht verfügbar");
+        lastMessage = text("BRAK POŁĄCZENIA Wi-Fi",
+                           "NO WI-Fi CONNECTION",
+                           "SIN CONEXIÓN Wi-Fi",
+                           "KEINE Wi-Fi-VERBINDUNG");
+    } else if (config.mode == Mode::Online && !onlineEmployeesLoaded) {
+        lastMessage = text("Pobieranie listy pracowników...",
+                           "Loading employee list...",
+                           "Cargando lista de empleados...",
+                           "Mitarbeiterliste wird geladen...");
     } else {
         lastMessage = "";
     }
@@ -2728,7 +4775,87 @@ void setupRcp() {
                   static_cast<unsigned>(employees.size()));
 }
 
+void expireNetworkRequests() {
+    constexpr uint32_t kRequestDeadlineMs = kHttpTimeoutMs + 5000;
+    const uint32_t now = millis();
+    if (employeeRefreshRequestId != 0 &&
+        now - employeeRefreshRequestStartedAt > kRequestDeadlineMs) {
+        Serial.println("Employee refresh result timed out");
+        employeeRefreshRequestId = 0;
+        employeeRefreshRequestStartedAt = 0;
+        nextNetworkAttemptAt = now;
+    }
+    if (attendanceStateRequestId != 0 &&
+        now - attendanceStateRequestStartedAt > kRequestDeadlineMs) {
+        Serial.println("Attendance state check timed out");
+        attendanceStateRequestId = 0;
+        attendanceStateRequestStartedAt = 0;
+        lastMessage = text("Nie można sprawdzić statusu obecności",
+                           "Could not check attendance status",
+                           "No se pudo comprobar la asistencia",
+                           "Anwesenheitsstatus konnte nicht geprüft werden");
+        screen = Screen::Home;
+        drawHome();
+    }
+    if (pendingEmployeeUpdateRequestId != 0 &&
+        now - employeeUpdateRequestStartedAt > kRequestDeadlineMs) {
+        Serial.println("Employee update result timed out");
+        pendingEmployeeUpdateRequestId = 0;
+        employeeUpdateRequestStartedAt = 0;
+        lastMessage =
+            text("Wynik aktualizacji nieznany — odśwież listę",
+                 "Update result unknown — refresh the list",
+                 "Resultado desconocido — actualice la lista",
+                 "Ergebnis unbekannt — Liste aktualisieren");
+        if (screen == Screen::EmployeeList) drawEmployeeList();
+    }
+    if (pendingEmployeeRegistrationRequestId != 0 &&
+        now - employeeRegistrationRequestStartedAt > kRequestDeadlineMs) {
+        Serial.println("Employee registration result timed out");
+        pendingEmployeeRegistrationRequestId = 0;
+        employeeRegistrationRequestStartedAt = 0;
+        lastMessage =
+            text("Wynik nieznany — ponów zapis, jeśli pracownik nie jest na liście",
+                 "Result unknown — retry if employee is not listed",
+                 "Resultado desconocido — reintente si no aparece",
+                 "Ergebnis unbekannt — erneut speichern, falls nicht gelistet");
+        if (screen == Screen::EmployeeEnroll) drawEmployeeEnrollment();
+    }
+    if (pendingQueueUploadRequestId != 0 &&
+        now - pendingQueueUploadStartedAt > kRequestDeadlineMs) {
+        Serial.println("Temporary attendance upload timed out; keeping queue row");
+        pendingQueueUploadRequestId = 0;
+        pendingQueueUploadStartedAt = 0;
+        pendingQueueUploadEventId = "";
+        pendingQueueSyncFailed = true;
+        lastMessage = text("Wysyłanie odbić nie powiodło się — kolejka zachowana",
+                           "Punch sync failed — queue retained",
+                           "Error al sincronizar — cola conservada",
+                           "Synchronisierung fehlgeschlagen — Warteschlange bleibt");
+        if (screen == Screen::Home) drawHome();
+        nextQueueUploadAttemptAt = now + 10000;
+    }
+    if (pendingAttendanceRequestId != 0 &&
+        now - pendingAttendanceRequestStartedAt > kRequestDeadlineMs) {
+        Serial.println("Attendance write result timed out; checking event ID");
+        pendingAttendanceRequestId = 0;
+        pendingAttendanceRequestStartedAt = 0;
+        nextPendingStatusAttemptAt = now;
+    }
+    if (pendingStatusRequestId != 0 &&
+        now - pendingStatusRequestStartedAt > kRequestDeadlineMs) {
+        Serial.println("Attendance status result timed out");
+        pendingStatusRequestId = 0;
+        pendingStatusRequestStartedAt = 0;
+        pendingStatusCheckInFlight = false;
+        nextPendingStatusAttemptAt = now + 1000;
+    }
+}
+
 void loopRcp() {
+    expireNetworkRequests();
+    handleAsyncNetworkResults();
+    updateWifiProgress();
     handleTouch();
     if (screen == Screen::Home || screen == Screen::AddEmployeeCard) handleCard();
 
@@ -2737,7 +4864,14 @@ void loopRcp() {
         screen = Screen::Home;
         attendanceConfirmationTitle = "";
         attendanceConfirmationName = "";
-        lastMessage = "";
+        if (pendingOnlineEventId.isEmpty()) {
+            lastMessage = "";
+        } else {
+            lastMessage = text("Wynik odbicia nieznany — trwa weryfikacja",
+                               "Punch result unknown — checking",
+                               "Resultado desconocido — verificando",
+                               "Buchung unbekannt — Prüfung läuft");
+        }
         lastClockDraw = 0;
         drawHome();
     }
@@ -2754,23 +4888,34 @@ void loopRcp() {
         setRelay(false);
     }
 
-    if (configurationValid && config.mode == Mode::Online &&
+    if (!wifiSetupActive && configurationValid && config.mode == Mode::Online &&
         static_cast<int32_t>(millis() - nextNetworkAttemptAt) >= 0) {
         nextNetworkAttemptAt = millis() + 10000;
         if (WiFi.status() != WL_CONNECTED) {
-            onlineEmployeesLoaded = false;
-            employees.clear();
+            const String disconnectedMessage =
+                text("BRAK POŁĄCZENIA Wi-Fi", "NO WI-Fi CONNECTION",
+                     "SIN CONEXIÓN Wi-Fi", "KEINE Wi-Fi-VERBINDUNG");
+            if (lastMessage.isEmpty()) {
+                lastMessage = disconnectedMessage;
+                if (screen == Screen::Home) drawHome();
+            }
             WiFi.reconnect();
         } else if (!onlineEmployeesLoaded || millis() >= nextEmployeeRefreshAt) {
-            nextEmployeeRefreshAt = millis() + kEmployeeRefreshMs;
-            if (!loadEmployeesFromOnlineSheet()) {
-                Serial.println("Online employee refresh failed; no offline fallback");
-            } else {
+            const String disconnectedMessage =
+                text("BRAK POŁĄCZENIA Wi-Fi", "NO WI-Fi CONNECTION",
+                     "SIN CONEXIÓN Wi-Fi", "KEINE Wi-Fi-VERBINDUNG");
+            if (lastMessage == disconnectedMessage && !hasPendingOnlineAttendance()) {
                 lastMessage = "";
-                if (screen == Screen::EmployeeList) drawEmployeeList();
-                else if (screen == Screen::Home) drawHome();
+                if (screen == Screen::Home) drawHome();
             }
+            nextEmployeeRefreshAt = millis() + kEmployeeRefreshMs;
+            queueOnlineEmployeeRefresh();
         }
+    }
+    if (screen == Screen::Home && config.mode == Mode::Online &&
+        WiFi.status() == WL_CONNECTED && hasPendingOnlineAttendance() &&
+        pendingQueueUploadRequestId == 0) {
+        startPendingOnlineAttendanceUpload();
     }
 
     if (screen == Screen::Home && millis() - lastClockDraw >= kClockRefreshMs) {

@@ -195,9 +195,12 @@ def apps_script_request(
             body = json.load(response)
     except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as error:
         raise ValueError(f"Nie udało się sprawdzić Apps Script: {error}") from error
-    if not isinstance(body, dict) or body.get("ok") is not True:
-        error = body.get("error", "Apps Script zwrócił nieprawidłową odpowiedź.")
-        raise ValueError(str(error))
+    if not isinstance(body, dict):
+        raise ValueError("Apps Script zwrócił nieprawidłową odpowiedź.")
+    if body.get("ok") is not True:
+        raise ValueError(
+            str(body.get("error", "Apps Script zwrócił nieprawidłową odpowiedź."))
+        )
     return body
 
 

@@ -1,7 +1,9 @@
 import json
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from rcp2027_app.data.schemas import (
     ATTENDANCE_FIELDS,
@@ -11,6 +13,7 @@ from rcp2027_app.data.schemas import (
     LOG_FIELDS,
     LOGS_FILE,
     DeviceConfig,
+    apps_script_request,
     generate_api_token,
     load_config,
     load_csv,
@@ -115,6 +118,19 @@ class SchemaTests(unittest.TestCase):
     def test_generated_api_token_is_high_entropy_sized(self) -> None:
         token = generate_api_token()
         self.assertGreaterEqual(len(token), 32)
+
+    def test_apps_script_rejects_non_object_response(self) -> None:
+        response = Mock()
+        response.__enter__ = Mock(return_value=BytesIO(b"[]"))
+        response.__exit__ = Mock(return_value=False)
+        with patch(
+            "rcp2027_app.data.schemas.urlopen", return_value=response
+        ), self.assertRaisesRegex(ValueError, "nieprawidłową odpowiedź"):
+            apps_script_request(
+                "https://script.google.com/macros/s/deployment/exec",
+                "x" * 32,
+                "ping",
+            )
 
     def test_saved_config_is_json(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

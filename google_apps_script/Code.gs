@@ -25,6 +25,9 @@ function doPost(event) {
     if (action === "lastAttendance") {
       return json_({ ok: true, last_event_type: lastEventFor_(request.employee_id) });
     }
+    if (action === "eventStatus") {
+      return attendanceEventStatus_(request.event_id);
+    }
     if (action === "attendanceRecords") {
       return readResponse_("ATTENDANCE_SHEET_ID");
     }
@@ -147,6 +150,23 @@ function append_(propertyName, headers, row) {
     }
     const sheetHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getDisplayValues()[0];
     verifyHeaders_(sheet, headers);
+    if (propertyName === "ATTENDANCE_SHEET_ID") {
+      const existing = findAttendanceByEventId_(sheet, row.event_id);
+      if (existing) {
+        assertSameAttendanceRequest_(existing, row);
+        if (existing.event_type === "ENTRY" || existing.event_type === "EXIT") {
+          PropertiesService.getScriptProperties().setProperty(
+            lastEventKey_(existing.employee_id), existing.event_type
+          );
+        }
+        return json_({
+          ok: true,
+          event_id: row.event_id,
+          event_type: existing.event_type,
+          duplicate: true
+        });
+      }
+    }
     sheet.appendRow(sheetHeaders.map(header =>
       safeCell_(row[header] === undefined ? "" : row[header])
     ));
@@ -156,7 +176,12 @@ function append_(propertyName, headers, row) {
         lastEventKey_(row.employee_id), row.event_type
       );
     }
-    return json_({ ok: true });
+    const response = { ok: true };
+    if (propertyName === "ATTENDANCE_SHEET_ID") {
+      response.event_id = row.event_id;
+      response.event_type = row.event_type;
+    }
+    return json_(response);
   } finally {
     lock.releaseLock();
   }
@@ -175,11 +200,22 @@ function registerEmployee_(row) {
     const employeeId = String(row.employee_id).trim().toLowerCase();
     const cardUid = String(row.card_uid).trim().toUpperCase();
     for (let index = 1; index < values.length; ++index) {
-      if (String(values[index][0]).trim().toLowerCase() === employeeId) {
-        throw new Error("employee_id_already_exists");
-      }
-      if (String(values[index][1]).trim().toUpperCase() === cardUid) {
-        throw new Error("card_uid_already_exists");
+      const existingId = String(values[index][0]).trim().toLowerCase();
+      const existingCard = String(values[index][1]).trim().toUpperCase();
+      const sameId = existingId === employeeId;
+      const sameCard = existingCard === cardUid;
+      if (sameId || sameCard) {
+        const sameRecord = sameId && sameCard &&
+          String(values[index][2]) === String(row.first_name) &&
+          String(values[index][3]) === String(row.last_name) &&
+          ["true", "1"].includes(String(values[index][4]).trim().toLowerCase()) ===
+            ["true", "1"].includes(String(row.active).trim().toLowerCase()) &&
+          ["true", "1"].includes(String(values[index][5]).trim().toLowerCase()) ===
+            ["true", "1"].includes(String(row.relay_access).trim().toLowerCase());
+        if (sameRecord) return json_({ ok: true, duplicate: true });
+        throw new Error(sameId
+          ? "employee_id_already_exists"
+          : "card_uid_already_exists");
       }
     }
     sheet.appendRow(EMPLOYEE_HEADERS.map(header =>
@@ -231,7 +267,7 @@ function updateEmployee_(row) {
 }
 
 function recordPunch_(row) {
-  if (!row || !row.employee_id || !row.card_uid || !row.timestamp) {
+  if (!row || !row.event_id || !row.employee_id || !row.card_uid || !row.timestamp) {
     throw new Error("invalid_punch");
   }
   const id = PropertiesService.getScriptProperties().getProperty("ATTENDANCE_SHEET_ID");
@@ -241,6 +277,19 @@ function recordPunch_(row) {
   try {
     const sheet = SpreadsheetApp.openById(id).getSheets()[0];
     verifyHeaders_(sheet, ATTENDANCE_HEADERS);
+    const existing = findAttendanceByEventId_(sheet, row.event_id);
+    if (existing) {
+      assertSameAttendanceRequest_(existing, row);
+      PropertiesService.getScriptProperties().setProperty(
+        lastEventKey_(existing.employee_id), existing.event_type
+      );
+      return json_({
+        ok: true,
+        event_id: row.event_id,
+        event_type: existing.event_type,
+        duplicate: true
+      });
+    }
     const previous = lastEventFor_(row.employee_id, sheet);
     const eventType = previous === "ENTRY" ? "EXIT" : "ENTRY";
     row.event_type = eventType;
@@ -251,9 +300,49 @@ function recordPunch_(row) {
     PropertiesService.getScriptProperties().setProperty(
       lastEventKey_(row.employee_id), eventType
     );
-    return json_({ ok: true, event_type: eventType });
+    return json_({ ok: true, event_id: row.event_id, event_type: eventType });
   } finally {
     lock.releaseLock();
+  }
+}
+
+function attendanceEventStatus_(eventId) {
+  if (!String(eventId || "").trim()) throw new Error("event_id_required");
+  const id = PropertiesService.getScriptProperties().getProperty("ATTENDANCE_SHEET_ID");
+  if (!id) throw new Error("missing_sheet_configuration:ATTENDANCE_SHEET_ID");
+  const lock = LockService.getScriptLock();
+  lock.waitLock(5000);
+  try {
+    const sheet = SpreadsheetApp.openById(id).getSheets()[0];
+    verifyHeaders_(sheet, ATTENDANCE_HEADERS);
+    const row = findAttendanceByEventId_(sheet, eventId);
+    return json_(row
+      ? { ok: true, found: true, event_id: row.event_id, event_type: row.event_type }
+      : { ok: true, found: false, event_id: String(eventId) });
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function findAttendanceByEventId_(sheet, eventId) {
+  if (!String(eventId || "").trim() || sheet.getLastRow() < 2) return null;
+  const match = sheet.getRange(2, 1, sheet.getLastRow() - 1, 1)
+    .createTextFinder(String(eventId))
+    .matchEntireCell(true)
+    .findNext();
+  if (!match) return null;
+  const values = sheet.getRange(match.getRow(), 1, 1, ATTENDANCE_HEADERS.length)
+    .getDisplayValues()[0];
+  const row = {};
+  ATTENDANCE_HEADERS.forEach((header, index) => row[header] = values[index] || "");
+  return row;
+}
+
+function assertSameAttendanceRequest_(existing, request) {
+  if (String(existing.employee_id) !== String(request.employee_id) ||
+      String(existing.card_uid).toUpperCase() !== String(request.card_uid).toUpperCase() ||
+      (request.event_type && existing.event_type !== request.event_type)) {
+    throw new Error("event_id_conflict");
   }
 }
 

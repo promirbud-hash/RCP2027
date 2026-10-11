@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+from typing import Callable
 
+from PySide6.QtCore import QThread, QRect, Signal, Qt
+from PySide6.QtGui import QColor, QFontDatabase, QImage, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -13,6 +17,8 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -20,6 +26,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -47,6 +54,87 @@ from rcp2027_app.data.schemas import (
     validate_employee_rows,
     validate_sheet_url,
 )
+from rcp2027_app.data.wallpaper import (
+    WALLPAPER_HEIGHT,
+    WALLPAPER_WIDTH,
+    WALLPAPER_ZONES,
+    make_wallpaper_image,
+    save_wallpaper_assets,
+)
+
+
+class _WallpaperPreview(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setMinimumSize(600, 400)
+        self.image = QImage()
+        self.zones: list[dict] = []
+        self.visible_zone_ids: set[str] = set()
+
+    def set_preview(self, image: QImage, zones: list[dict], visible_zone_ids: set[str]) -> None:
+        self.image = image
+        self.zones = zones
+        self.visible_zone_ids = visible_zone_ids
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        del event
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#172033"))
+        scale = min(
+            self.width() / WALLPAPER_WIDTH,
+            self.height() / WALLPAPER_HEIGHT,
+        )
+        preview_width = round(WALLPAPER_WIDTH * scale)
+        preview_height = round(WALLPAPER_HEIGHT * scale)
+        left = (self.width() - preview_width) // 2
+        top = (self.height() - preview_height) // 2
+        preview_rect = self.rect().adjusted(0, 0, 0, 0)
+        preview_rect.setRect(left, top, preview_width, preview_height)
+        if not self.image.isNull():
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            painter.drawImage(preview_rect, self.image)
+        else:
+            painter.setPen(QColor("#ffffff"))
+            painter.drawText(preview_rect, Qt.AlignmentFlag.AlignCenter,
+                             "Wybierz obraz, aby zobaczyć podgląd tapety")
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        for zone in self.zones:
+            if zone["id"] not in self.visible_zone_ids:
+                continue
+            x, y, width, height = zone["rect"]
+            rect = QRect(
+                left + round(x * scale),
+                top + round(y * scale),
+                round(width * scale),
+                round(height * scale),
+            )
+            painter.fillRect(rect, QColor(4, 12, 24, 145))
+            painter.setPen(QPen(QColor("#ffd166"), 2, Qt.PenStyle.DashLine))
+            painter.drawRect(rect)
+            painter.setPen(QColor("#ffffff"))
+            painter.drawText(
+                rect.adjusted(6, 4, -4, -4),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+                zone["label"],
+            )
+
+
+class _AppsScriptWorker(QThread):
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, operation: Callable[[], object], parent: QWidget) -> None:
+        super().__init__(parent)
+        self._operation = operation
+
+    def run(self) -> None:
+        try:
+            result = self._operation()
+        except (OSError, ValueError) as error:
+            self.failed.emit(str(error))
+            return
+        self.succeeded.emit(result)
 
 
 class MainWindow(QMainWindow):
@@ -57,9 +145,12 @@ class MainWindow(QMainWindow):
         self.folder: Path | None = None
         self.remote_revisions: dict[str, str] = {}
         self.csv_paths: dict[str, Path] = {}
+        self._api_worker: _AppsScriptWorker | None = None
+        self._api_buttons: list[QPushButton] = []
 
         tabs = QTabWidget()
         tabs.addTab(self._configuration_page(), "Konfiguracja i karta SD")
+        tabs.addTab(self._wallpaper_page(), "Tapeta")
         self.employee_table = self._table_page(
             tabs, EMPLOYEE_FIELDS, EMPLOYEES_FILE, "Pracownicy", self._save_employees,
             "employees",
@@ -87,6 +178,13 @@ class MainWindow(QMainWindow):
             QPushButton:hover { background: #1745b8; }
             """
         )
+
+    def closeEvent(self, event) -> None:
+        if self._api_worker is not None and self._api_worker.isRunning():
+            self.status.setText("Poczekaj na zakończenie żądania do Google.")
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def _configuration_page(self) -> QWidget:
         page = QWidget()
@@ -160,6 +258,7 @@ class MainWindow(QMainWindow):
         verify_links.clicked.connect(self._verify_links)
         test_api = QPushButton("Testuj API")
         test_api.clicked.connect(self._test_api)
+        self._api_buttons.append(test_api)
         save = QPushButton("Zapisz konfigurację")
         save.clicked.connect(self._save_configuration)
         prepare = QPushButton("Przygotuj kartę SD")
@@ -175,6 +274,145 @@ class MainWindow(QMainWindow):
         layout.addLayout(buttons)
         layout.addStretch()
         return page
+
+    def _wallpaper_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        self.wallpaper_image = QImage()
+        self._wallpaper_source_path: str | None = None
+        self.wallpaper_output_dir: Path | None = None
+
+        controls = QHBoxLayout()
+        choose_image = QPushButton("Wybierz obraz")
+        choose_image.clicked.connect(self._choose_wallpaper_image)
+        self.wallpaper_source_label = QLabel("Nie wybrano obrazu")
+        self.wallpaper_sizing = QComboBox()
+        self.wallpaper_sizing.addItem("Wypełnij ekran (kadruj)", "crop")
+        self.wallpaper_sizing.addItem("Dopasuj cały obraz", "fit")
+        self.wallpaper_sizing.currentIndexChanged.connect(self._refresh_wallpaper_preview)
+        controls.addWidget(choose_image)
+        controls.addWidget(self.wallpaper_source_label, 1)
+        controls.addWidget(QLabel("Dopasowanie:"))
+        controls.addWidget(self.wallpaper_sizing)
+        layout.addLayout(controls)
+
+        screen_row = QHBoxLayout()
+        self.wallpaper_screen = QComboBox()
+        self.wallpaper_screen.addItem("Ekran główny", "home")
+        self.wallpaper_screen.addItem("Potwierdzenie odbicia", "attendance")
+        self.wallpaper_screen.currentIndexChanged.connect(self._refresh_wallpaper_zones)
+        screen_row.addWidget(QLabel("Podgląd oznaczeń dla:"))
+        screen_row.addWidget(self.wallpaper_screen)
+        screen_row.addStretch()
+        layout.addLayout(screen_row)
+
+        preview_row = QHBoxLayout()
+        self.wallpaper_preview = _WallpaperPreview()
+        preview_row.addWidget(self.wallpaper_preview, 1)
+        self.wallpaper_zone_list = QListWidget()
+        self.wallpaper_zone_list.setMaximumWidth(270)
+        self.wallpaper_zone_list.itemChanged.connect(self._refresh_wallpaper_preview)
+        preview_row.addWidget(self.wallpaper_zone_list)
+        layout.addLayout(preview_row, 1)
+
+        footer = QHBoxLayout()
+        self.wallpaper_output_label = QLabel("Nie wybrano folderu karty SD")
+        choose_output = QPushButton("Wybierz folder karty SD")
+        choose_output.clicked.connect(self._choose_wallpaper_output)
+        export = QPushButton("Eksportuj tapetę na SD")
+        export.clicked.connect(self._export_wallpaper)
+        footer.addWidget(self.wallpaper_output_label, 1)
+        footer.addWidget(choose_output)
+        footer.addWidget(export)
+        layout.addLayout(footer)
+
+        self.wallpaper_status = QLabel(
+            "Obraz zostanie przeskalowany do 480 × 320 pikseli. "
+            "Eksport tworzy plik RGB565 dla terminala, nagłówek C i szablon oznaczeń."
+        )
+        self.wallpaper_status.setWordWrap(True)
+        layout.addWidget(self.wallpaper_status)
+        self._refresh_wallpaper_zones()
+        return page
+
+    def _choose_wallpaper_image(self) -> None:
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "Wybierz obraz tapety",
+            "",
+            "Obrazy (*.png *.jpg *.jpeg *.bmp *.webp)",
+        )
+        if not filename:
+            return
+        try:
+            self.wallpaper_image = make_wallpaper_image(
+                filename, str(self.wallpaper_sizing.currentData())
+            )
+        except (OSError, ValueError) as error:
+            self._show_error(str(error))
+            return
+        self._wallpaper_source_path = filename
+        self.wallpaper_source_label.setText(Path(filename).name)
+        self._refresh_wallpaper_preview()
+
+    def _refresh_wallpaper_preview(self, *_args) -> None:
+        if self.wallpaper_image.isNull() or self._wallpaper_source_path is None:
+            return
+        try:
+            image = make_wallpaper_image(
+                self._wallpaper_source_path,
+                str(self.wallpaper_sizing.currentData()),
+            )
+        except (OSError, ValueError) as error:
+            self.wallpaper_status.setText(f"Nie można przygotować podglądu: {error}")
+            return
+        self.wallpaper_image = image
+        zones = WALLPAPER_ZONES[str(self.wallpaper_screen.currentData())]
+        visible_ids = {
+            self.wallpaper_zone_list.item(index).data(Qt.ItemDataRole.UserRole)
+            for index in range(self.wallpaper_zone_list.count())
+            if self.wallpaper_zone_list.item(index).checkState()
+            == Qt.CheckState.Checked
+        }
+        self.wallpaper_preview.set_preview(image, zones, visible_ids)
+
+    def _refresh_wallpaper_zones(self, *_args) -> None:
+        if not hasattr(self, "wallpaper_zone_list"):
+            return
+        self.wallpaper_zone_list.blockSignals(True)
+        self.wallpaper_zone_list.clear()
+        zones = WALLPAPER_ZONES[str(self.wallpaper_screen.currentData())]
+        for zone in zones:
+            item = QListWidgetItem(zone["label"])
+            item.setData(Qt.ItemDataRole.UserRole, zone["id"])
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            self.wallpaper_zone_list.addItem(item)
+        self.wallpaper_zone_list.blockSignals(False)
+        self._refresh_wallpaper_preview()
+
+    def _choose_wallpaper_output(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Wybierz folder karty SD")
+        if folder:
+            self.wallpaper_output_dir = Path(folder)
+            self.wallpaper_output_label.setText(str(self.wallpaper_output_dir))
+
+    def _export_wallpaper(self) -> None:
+        if self.wallpaper_image.isNull():
+            self._show_error("Najpierw wybierz obraz tapety.")
+            return
+        if self.wallpaper_output_dir is None:
+            self._show_error("Wybierz folder karty SD jako miejsce zapisu.")
+            return
+        try:
+            paths = save_wallpaper_assets(self.wallpaper_output_dir, self.wallpaper_image)
+        except (OSError, ValueError) as error:
+            self._show_error(f"Nie można wyeksportować tapety: {error}")
+            return
+        self.wallpaper_status.setText(
+            f"Zapisano: {paths[0].name} ({paths[0].stat().st_size} B), "
+            f"{paths[1].name}, {paths[2].name}. Uruchom ponownie terminal."
+        )
 
     def _table_page(
         self,
@@ -205,12 +443,14 @@ class MainWindow(QMainWindow):
             refresh.clicked.connect(
                 lambda: self._refresh_table(table, fields, filename, remote_action)
             )
+            self._api_buttons.append(refresh)
             controls.addWidget(refresh)
         else:
             refresh = QPushButton("Odśwież")
             refresh.clicked.connect(
                 lambda: self._refresh_table(table, fields, filename, remote_action)
             )
+            self._api_buttons.append(refresh)
             controls.addWidget(refresh)
         if editable:
             add = QPushButton("Dodaj rekord")
@@ -219,6 +459,7 @@ class MainWindow(QMainWindow):
             remove.clicked.connect(lambda: self._remove_selected(table))
             save = QPushButton("Zapisz / wyślij zmiany")
             save.clicked.connect(save_handler)
+            self._api_buttons.append(save)
             controls.addWidget(add)
             controls.addWidget(remove)
             controls.addStretch()
@@ -235,31 +476,41 @@ class MainWindow(QMainWindow):
         remote_action: str,
     ) -> None:
         if self.mode.currentData() == "online":
-            try:
-                response = apps_script_request(
-                    self.apps_script.text().strip(),
-                    self.api_token.text(),
-                    remote_action,
-                )
+            endpoint = self.apps_script.text().strip()
+            token = self.api_token.text()
+
+            def apply_response(response: object) -> None:
+                if not isinstance(response, dict):
+                    self._show_error("API zwróciło nieprawidłową odpowiedź.")
+                    return
                 rows = response.get("rows")
                 if not isinstance(rows, list):
-                    raise ValueError("API nie zwróciło listy rekordów.")
-                table.setRowCount(0)
+                    self._show_error("API nie zwróciło listy rekordów.")
+                    return
+                converted_rows: list[dict[str, str]] = []
                 for row in rows:
                     if not isinstance(row, dict):
-                        raise ValueError("API zwróciło rekord o nieprawidłowym formacie.")
-                    row_index = table.rowCount()
-                    table.insertRow(row_index)
-                    for column, field in enumerate(fields):
-                        value = row.get(field, "")
-                        table.setItem(row_index, column, QTableWidgetItem(str(value)))
+                        self._show_error(
+                            "API zwróciło rekord o nieprawidłowym formacie."
+                        )
+                        return
+                    converted_rows.append(
+                        {field: str(row.get(field, "")) for field in fields}
+                    )
+                self._set_table_rows(table, fields, converted_rows)
                 revision = response.get("revision")
                 if isinstance(revision, str):
                     self.remote_revisions[remote_action] = revision
-            except (ValueError, OSError) as error:
-                self._show_error(str(error))
-                return
-            self.status.setText(f"Pobrano dane z Google Apps Script: {filename}.")
+
+                self.status.setText(
+                    f"Pobrano dane z Google Apps Script: {filename}."
+                )
+
+            self._start_api_worker(
+                lambda: apps_script_request(endpoint, token, remote_action),
+                apply_response,
+                self._show_error,
+            )
             return
         self._load_table(table, fields, filename)
 
@@ -415,21 +666,29 @@ class MainWindow(QMainWindow):
         if not revision:
             self._show_error("Najpierw odśwież dane z Google, aby uniknąć nadpisania nowych rekordów.")
             return
-        try:
-            response = apps_script_request(
-                self.apps_script.text().strip(),
-                self.api_token.text(),
+        endpoint = self.apps_script.text().strip()
+        token = self.api_token.text()
+
+        def apply_response(response: object) -> None:
+            if not isinstance(response, dict):
+                self._show_error("API zwróciło nieprawidłową odpowiedź.")
+                return
+            new_revision = response.get("revision")
+            if isinstance(new_revision, str):
+                self.remote_revisions[read_action] = new_revision
+            self.status.setText(f"Wysłano tabelę do Google Sheets: {filename}.")
+
+        self._start_api_worker(
+            lambda: apps_script_request(
+                endpoint,
+                token,
                 action,
                 rows=rows,
                 expected_revision=revision,
-            )
-        except (ValueError, OSError) as error:
-            self._show_error(str(error))
-            return
-        new_revision = response.get("revision")
-        if isinstance(new_revision, str):
-            self.remote_revisions[read_action] = new_revision
-        self.status.setText(f"Wysłano tabelę do Google Sheets: {filename}.")
+            ),
+            apply_response,
+            self._show_error,
+        )
 
     def _save_employees(self) -> None:
         rows = self._table_rows(self.employee_table, EMPLOYEE_FIELDS)
@@ -462,8 +721,35 @@ class MainWindow(QMainWindow):
     def _save_logs(self) -> None:
         self._show_error("Logi są tylko do odczytu.")
 
+    def _start_api_worker(
+        self,
+        operation: Callable[[], object],
+        on_success: Callable[[object], None],
+        on_error: Callable[[str], None],
+    ) -> None:
+        if self._api_worker is not None:
+            self.status.setText("Poczekaj na zakończenie trwającego żądania.")
+            return
+        worker = _AppsScriptWorker(operation, self)
+        self._api_worker = worker
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_error)
+        worker.finished.connect(self._finish_api_worker)
+        for button in self._api_buttons:
+            button.setEnabled(False)
+        self.status.setText("Łączenie z Google Apps Script…")
+        worker.start()
+
+    def _finish_api_worker(self) -> None:
+        self._api_worker = None
+        for button in self._api_buttons:
+            button.setEnabled(True)
+
     def _show_help(self) -> None:
-        script_path = Path(__file__).resolve().parents[4] / "google_apps_script" / "Code.gs"
+        bundle_root = Path(
+            getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[4])
+        )
+        script_path = bundle_root / "google_apps_script" / "Code.gs"
         try:
             script = script_path.read_text(encoding="utf-8")
         except OSError as error:
@@ -472,44 +758,84 @@ class MainWindow(QMainWindow):
 
         dialog = QDialog(self)
         dialog.setWindowTitle("Pomoc — konfiguracja Google Sheets i Apps Script")
-        dialog.resize(980, 780)
+        dialog.resize(1120, 820)
         layout = QVBoxLayout(dialog)
-        instructions = QPlainTextEdit()
-        instructions.setReadOnly(True)
-        instructions.setPlainText(
-            "1. Utwórz trzy osobne arkusze Google; w pierwszym wierszu pierwszej "
-            "zakładki każdego arkusza wklej odpowiedni nagłówek dokładnie w tej "
-            "kolejności:\\n\\n"
-            "Pracownicy:\\n"
-            "employee_id, card_uid, first_name, last_name, active, relay_access\\n\\n"
-            "Ewidencja czasu:\\n"
-            "event_id, timestamp, employee_id, card_uid, event_type, photo_file, "
-            "source, notes\\n\\n"
-            "Logi:\\n"
-            "event_id, timestamp, level, code, message\\n\\n"
-            "2. Otwórz https://script.google.com, utwórz projekt Apps Script i "
-            "zastąp zawartość pliku Code.gs skopiowanym kodem poniżej. Zapisz "
-            "projekt.\\n"
-            "3. W ustawieniach projektu → Właściwości skryptu dodaj: "
-            "RCP_API_TOKEN (ten sam tajny token co w aplikacji), "
-            "EMPLOYEES_SHEET_ID, ATTENDANCE_SHEET_ID i LOGS_SHEET_ID. ID każdego "
-            "arkusza to część adresu pomiędzy /spreadsheets/d/ a następnym /.\\n"
-            "4. Wdróż → Nowe wdrożenie → Aplikacja internetowa. Wykonuj jako "
-            "właściciel; dostęp ustaw zgodnie z polityką Google Workspace "
-            "(urządzenie wymaga publicznego endpointu, a każda operacja jest "
-            "chroniona tokenem). Skopiuj URL kończący się /exec.\\n"
-            "5. W aplikacji wybierz tryb online, wklej URL /exec, token i linki "
-            "do trzech arkuszy, kliknij Sprawdź linki oraz Testuj API, a potem "
-            "Przygotuj kartę SD. Po zmianie kodu opublikuj nową wersję wdrożenia.\\n\\n"
-            "Nie udostępniaj tokenu ani pliku config.json — zawiera token API i "
-            "hasło Wi-Fi. Kod API:"
+        help_tabs = QTabWidget()
+        instructions = QTextBrowser()
+        instructions.setOpenExternalLinks(True)
+        instructions.setStyleSheet(
+            "QTextBrowser { background: #ffffff; color: #172033; border: 0; "
+            "font-family: 'Segoe UI'; font-size: 12pt; padding: 12px; }"
         )
-        instructions.setMaximumHeight(270)
-        layout.addWidget(instructions)
+        instructions.setHtml(
+            """
+            <html><head><style>
+            body { font-family: 'Segoe UI', sans-serif; font-size: 12pt;
+                   line-height: 1.5; color: #172033; }
+            h2 { color: #1745b8; font-size: 17pt; margin-top: 18px; }
+            h3 { color: #2457d6; font-size: 13pt; margin-bottom: 5px; }
+            p, li { margin-top: 6px; margin-bottom: 8px; }
+            code { font-family: Consolas, monospace; background: #eef2f8;
+                   padding: 3px 5px; }
+            .warning { background: #fff4df; border-left: 5px solid #e3a126;
+                       padding: 10px; }
+            </style></head><body>
+            <h2>1. Przygotuj arkusze Google</h2>
+            <p>Utwórz trzy osobne arkusze. W pierwszym wierszu pierwszej zakładki
+            każdego arkusza wklej nagłówek z odpowiedniej sekcji, zachowując
+            kolejność kolumn.</p>
+            <h3>Pracownicy</h3>
+            <p><code>employee_id, card_uid, first_name, last_name, active, relay_access</code></p>
+            <h3>Ewidencja czasu</h3>
+            <p><code>event_id, timestamp, employee_id, card_uid, event_type, photo_file, source, notes</code></p>
+            <h3>Logi</h3>
+            <p><code>event_id, timestamp, level, code, message</code></p>
+
+            <h2>2. Utwórz projekt Apps Script</h2>
+            <p>Otwórz <a href="https://script.google.com">script.google.com</a>,
+            utwórz projekt i zastąp zawartość pliku <code>Code.gs</code> kodem
+            z zakładki „Kod Apps Script”. Zapisz projekt.</p>
+
+            <h2>3. Ustaw właściwości skryptu</h2>
+            <p>W ustawieniach projektu → Właściwości skryptu dodaj:</p>
+            <ul>
+              <li><code>RCP_API_TOKEN</code> — ten sam tajny token co w aplikacji;</li>
+              <li><code>EMPLOYEES_SHEET_ID</code>;</li>
+              <li><code>ATTENDANCE_SHEET_ID</code>;</li>
+              <li><code>LOGS_SHEET_ID</code>.</li>
+            </ul>
+            <p>ID arkusza to część adresu pomiędzy
+            <code>/spreadsheets/d/</code> a następnym ukośnikiem.</p>
+
+            <h2>4. Wdróż aplikację internetową</h2>
+            <p>Wybierz Wdróż → Nowe wdrożenie → Aplikacja internetowa.
+            Ustaw wykonywanie jako właściciel. Dostęp skonfiguruj zgodnie
+            z polityką Google Workspace — urządzenie wymaga publicznego
+            endpointu, a każda operacja jest chroniona tokenem. Skopiuj URL
+            kończący się na <code>/exec</code>.</p>
+
+            <h2>5. Skonfiguruj aplikację RCP2027</h2>
+            <p>Wybierz tryb online, wklej URL <code>/exec</code>, token i linki
+            do trzech arkuszy. Kliknij „Sprawdź linki” i „Testuj API”, a następnie
+            „Przygotuj kartę SD”. Po zmianie kodu opublikuj nową wersję wdrożenia.</p>
+
+            <p class="warning"><b>Bezpieczeństwo:</b> nie udostępniaj tokenu ani
+            pliku <code>config.json</code> — zawiera token API i hasło Wi-Fi.</p>
+            </body></html>
+            """
+        )
+        help_tabs.addTab(instructions, "Instrukcja")
         code_box = QPlainTextEdit()
         code_box.setReadOnly(True)
         code_box.setPlainText(script)
-        layout.addWidget(code_box, 1)
+        code_box.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        code_box.setStyleSheet(
+            "QPlainTextEdit { background: #ffffff; color: #172033; "
+            "font-size: 10pt; padding: 10px; }"
+        )
+        code_box.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        help_tabs.addTab(code_box, "Kod Apps Script")
+        layout.addWidget(help_tabs, 1)
         controls = QHBoxLayout()
         copy_button = QPushButton("Kopiuj kod")
         copy_button.clicked.connect(
@@ -577,20 +903,20 @@ class MainWindow(QMainWindow):
         )
 
     def _test_api(self) -> None:
-        try:
-            result = check_apps_script(
-                self.apps_script.text().strip(),
-                self.api_token.text(),
-                (
-                    self.employees_sheet.text().strip(),
-                    self.attendance_sheet.text().strip(),
-                    self.logs_sheet.text().strip(),
-                ),
-            )
-        except ValueError as error:
-            self.status.setText(str(error))
-            return
-        self.status.setText(result)
+        endpoint = self.apps_script.text().strip()
+        token = self.api_token.text()
+        sheet_urls = (
+            self.employees_sheet.text().strip(),
+            self.attendance_sheet.text().strip(),
+            self.logs_sheet.text().strip(),
+        )
+        self._start_api_worker(
+            lambda: check_apps_script(
+                endpoint, token, sheet_urls
+            ),
+            lambda result: self.status.setText(str(result)),
+            lambda message: self.status.setText(message),
+        )
 
     def _save_configuration(self) -> None:
         if self.folder is None:
