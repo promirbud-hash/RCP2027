@@ -1,68 +1,73 @@
 # RCP2027 PROMIR-BUD PASSION LINE
 
-System składa się z terminala na ESP32-S3 N16R8 z ekranem dotykowym ILI9488
-3,5" (320 × 480) oraz desktopowej aplikacji PySide6 do przygotowania karty SD,
-zarządzania pracownikami i przeglądania/korygowania zdarzeń.
+RCP2027 is a time and attendance system built around an ESP32-S3 N16R8
+terminal with a 3.5-inch ILI9488 touchscreen (320 × 480), together with a
+desktop application for preparing SD cards, managing employees, and reviewing
+or correcting attendance records.
 
-Projekt zawiera firmware terminala, aplikację desktopową i integrację z Google
-Sheets. Terminal obsługuje cztery języki: polski, angielski, hiszpański i
-niemiecki.
+The project includes the terminal firmware, a desktop application, and Google
+Sheets integration. The terminal interface supports Polish, English, Spanish,
+and German.
 
-## Elementy systemu
+## System components
 
-- `src/`, `include/`, `boards/`, `platformio.ini` — główny projekt PlatformIO
-  firmware: LovyanGFX, ekran i dotyk, MFRC522, RTC
-  DS3231, karta SD, opcjonalna kamera OV2640, przekaźnik, PIN i tryby pracy.
-- `desktop/` — edytor konfiguracji SD, pracowników, ewidencji oraz logów.
-- `google_apps_script/Code.gs` — pośredniczące, autoryzowane API do odczytu i
-  zapisu Arkuszy Google.
-- `data/` — wzorcowy plik konfiguracji i nagłówki CSV.
-- `docs/ARCHITECTURE.md` — formaty danych, pinout, konfiguracja API i granice
-  obecnej implementacji.
+- `src/`, `include/`, `boards/`, `platformio.ini` — the PlatformIO firmware,
+  including LovyanGFX, the display and touch interface, MFRC522 RFID reader,
+  DS3231 RTC, SD card, optional OV2640 camera, relay, PIN, and operating modes.
+- `desktop/` — tools for configuring SD cards and managing employees,
+  attendance records, and logs.
+- `google_apps_script/Code.gs` — authenticated API for reading and writing
+  Google Sheets.
+- `data/` — example configuration and CSV headers.
+- `docs/ARCHITECTURE.md` — data formats, pinout, API configuration, and
+  implementation boundaries.
+- [`MANUAL.PDF`](./MANUAL.PDF) — Polish user manual.
+- [`MANUAL_EN.PDF`](./MANUAL_EN.PDF) — English user manual.
 
-## Funkcje terminala
+## Terminal features
 
-- Rejestracja wejść i wyjść kartą RFID z automatycznym rozpoznaniem kolejnego
-  zdarzenia; ekran potwierdza zapis imieniem i nazwiskiem.
-- Tryb offline odtwarza ostatni stan pracownika z historii raz przy starcie i
-  potwierdza odbicie dopiero po pełnym zapisie wiersza CSV. W trybie online
-  timeout jest pokazywany jako wynik nieznany; terminal sprawdza ten sam ID
-  zdarzenia i wstrzymuje następne odbicia, aby nie odwrócić stanu przez
-  powtórzenie skanu.
-- Gdy w trybie online zabraknie połączenia, terminal informuje o tym i prosi
-  pracownika o wybór wejścia lub wyjścia. Zdarzenie trafia do
-  `/attendance_pending.csv` na SD i jest wysyłane do Arkusza Google po
-  odzyskaniu sieci; terminal zachowuje kolejność i nie usuwa wpisu przed
-  potwierdzeniem przez API. Wymaga to dostępnej karty SD.
-- Karty z uprawnieniem przekaźnika pozwalają zarejestrować wejście, gdy
-  pracownik jest poza zakładem; po wejściu umożliwiają wybór wyjścia albo
-  krótkiego odblokowania drzwi.
-- Nieznaną kartę można dodać na terminalu po potwierdzeniu i podaniu PIN-u.
-- Ustawienia chronione PIN-em: język, tryb pracy, zdjęcia, wybór jednego z
-  siedmiu krojów pisma (Unicode, Sans/Serif/Mono regular lub pogrubione), jasny
-  lub ciemny tryb kolorów, lista pracowników, data i godzina, zmiana PIN-u oraz
-  kalibracja dotyku. Dostępna jest też konfiguracja Wi-Fi: wybór sieci,
-  wpisanie hasła i zapis po udanym połączeniu do `config.json` na karcie SD.
-- Lista pracowników pozwala zmienić uprawnienia przekaźnika i dezaktywować
-  pracownika bez usuwania jego historii. Nowego pracownika można dodać po
-  zeskanowaniu nowej karty.
-- Ekran oczekiwania pokazuje godzinę, datę i losowe hasło motywujące: po jednym
-  z zestawu 50 haseł na każdy język. Hasło zmienia się raz na dzień.
-- Opcjonalna tapeta z pliku `/WALLPAPER.RGB565` jest ładowana do PSRAM i
-  wyświetlana na ekranie głównym oraz potwierdzeniach wejścia/wyjścia; można
-  ją włączać i wyłączać w ustawieniach.
-- Kalibracja dotyku uruchamia się przy pierwszym starcie i może być ponowiona
-  z ustawień; wynik jest zapisywany w pamięci trwałej.
-- Logi zapisywane są w `/logs.csv` na SD także w trybie online. Online są
-  dodatkowo wysyłane do skonfigurowanego arkusza.
-- Zdjęcia, jeśli funkcja jest włączona i kamera dostępna, zapisywane są w
-  katalogu `/photos` na karcie SD jako
-  `nazwisko_imie_id_RRRRMMDD_GGMM.jpg`; przy kolizji nazwy dodawany jest
-  identyfikator zdarzenia, aby zdjęcia nie zostały nadpisane.
+- RFID attendance with automatic entry/exit detection; the display confirms
+  the employee's name after a recorded punch.
+- Offline mode restores each employee's last attendance state from the log at
+  startup and confirms a punch only after the complete CSV row has been
+  written. In online mode, a timeout is treated as an unknown result: the
+  terminal checks the same event ID and pauses subsequent punches to avoid
+  reversing attendance state by retrying a scan.
+- If the network is unavailable in online mode, the terminal asks the employee
+  to choose entry or exit. The event is saved to `/attendance_pending.csv` on
+  the SD card and uploaded to Google Sheets after connectivity is restored.
+  Events are sent in order and are not removed until acknowledged by the API.
+  An available SD card is required.
+- Cards with relay access can record entry when the employee is outside the
+  facility; after entry, they can choose to record an exit or briefly unlock
+  the door.
+- Unknown cards can be enrolled at the terminal after confirmation and PIN
+  entry.
+- PIN-protected settings include language, operating mode, photos, seven font
+  styles (Unicode, regular or bold Sans/Serif/Mono), light or dark color mode,
+  employee list, date and time, PIN changes, and touch calibration. Wi-Fi
+  settings allow the user to select a network, enter its password, and save
+  the configuration to `config.json` on the SD card after a successful
+  connection.
+- Employee management can change relay permissions and deactivate employees
+  without deleting their history. New employees can be added by scanning a
+  new card.
+- The idle screen shows the time, date, and a daily motivational quote selected
+  from a set of 50 quotes per language.
+- An optional `/WALLPAPER.RGB565` image is loaded into PSRAM and shown on the
+  home screen and attendance confirmations. It can be enabled or disabled in
+  settings.
+- Touch calibration runs on first startup and can be repeated from settings;
+  the calibration is stored in persistent memory.
+- Logs are saved to `/logs.csv` on the SD card in both operating modes. In
+  online mode, they are also sent to the configured spreadsheet.
+- When enabled and the camera is available, photos are saved under `/photos`
+  on the SD card as `surname_firstname_id_YYYYMMDD_HHMM.jpg`. An event ID is
+  added if a filename already exists so that photos are not overwritten.
 
-## Aplikacja desktopowa
+## Desktop application
 
-Python 3.10+:
+Python 3.10 or later:
 
 ```powershell
 cd RCP2027\desktop
@@ -83,82 +88,84 @@ python -m pip install -e ".[build]"
 The executable is created at `desktop\dist\RCP2027.exe`; it includes the
 Google Apps Script example used by the in-app help.
 
-Najpierw wybierz główny katalog karty SD (np. `E:\`) i użyj **Przygotuj kartę
-SD**. Aplikacja zapisze `config.json`, utworzy brakujące pliki CSV z nagłówkami
-oraz katalog `photos`; istniejące pliki CSV i rekordy pozostaną bez zmian.
-Brakujące CSV są również tworzone automatycznie po wybraniu katalogu karty SD.
-Tryb offline może rozpocząć pracę z pustą listą pracowników; dodaj pierwszą
-kartę przy terminalu albo przez aplikację desktopową. Do odczytu ewidencji i
-logów wskaż odpowiedni plik CSV na karcie SD; ewidencję możesz później ręcznie
-skorygować i zapisać do wybranego pliku. W
-trybie online przyciski odświeżania pobierają dane przez Apps Script; zapis
-pracowników lub ewidencji do chmury wymaga
-potwierdzenia, ponieważ zastępuje zawartość odpowiedniego arkusza.
-Przycisk **Pomoc** pokazuje instrukcję tworzenia arkuszy, wymagane nagłówki,
-procedurę wdrożenia i kod Apps Script z przyciskiem kopiowania. Żądania sieciowe
-uruchamiane są w wątku `QThread`, więc okno pozostaje responsywne podczas
-oczekiwania na API.
+First, select the SD card's root directory (for example, `E:\`) and choose
+**Prepare SD card**. The application writes `config.json`, creates missing CSV
+files with headers, and creates the `photos` directory. Existing CSV files and
+records are preserved. Missing CSV files are also created automatically when
+an SD card directory is selected.
 
-Konfiguracja karty zawiera również język, tryb pracy, ustawienia Wi-Fi, linki
-do arkuszy i Apps Script oraz przełącznik zdjęć. Linki można sprawdzić w
-aplikacji przed zapisaniem konfiguracji.
+Offline mode can start with an empty employee list; add the first card at the
+terminal or in the desktop application. To view attendance records or logs,
+select the corresponding CSV file on the SD card. Attendance records can be
+manually edited and saved back to the selected file.
 
-Zakładka **Tapeta** pozwala dopasować obraz do ekranu 480 × 320, obejrzeć
-podgląd pól interfejsu dla ekranu głównego i potwierdzenia oraz zapisać na
-karcie `WALLPAPER.RGB565`. Eksport zawiera także nagłówek `wallpaper_rgb565.h`
-i szablon obszarów `wallpaper_layout.json`. Oznaczenia pól są podglądem
-stałego układu firmware; nie zmieniają położenia elementów na ekranie.
+In online mode, refresh buttons retrieve data through Apps Script. Uploading
+employees or attendance to the cloud requires confirmation because it
+replaces the contents of the corresponding spreadsheet. The **Help** button
+explains how to create the sheets, configure required headers, deploy the
+service, and use the Apps Script code, with a copy button. Network requests
+run in a `QThread` so the window remains responsive while waiting for the API.
 
-## Pierwsze uruchomienie terminala
+The card configuration also includes the language, operating mode, Wi-Fi
+settings, spreadsheet and Apps Script links, and the photo setting. Links can
+be validated in the application before saving the configuration.
 
-1. Zbuduj i wgraj firmware zgodnie z sekcją poniżej.
-2. Włóż kartę SD przygotowaną aplikacją desktopową. W trybie offline można
-   rozpocząć od pustej listy pracowników.
-3. Przy pierwszym uruchomieniu dotknij kolejno czterech punktów kalibracji.
-   Kalibrację można później powtórzyć w menu ustawień.
-4. Dotknij **USTAWIENIA** na ekranie startowym i podaj domyślny PIN `0000`.
-   Zmień go przed rozpoczęciem normalnej pracy.
-5. Dodaj pracowników w aplikacji desktopowej albo przy terminalu. Aby dodać
-   osobę przy urządzeniu, zeskanuj nieznaną kartę, wybierz **Tak**, podaj PIN
-   i wypełnij ID, imię oraz nazwisko. Możesz też nadać dostęp do przekaźnika.
-6. W trybie online zainstaluj Apps Script opisany poniżej, skonfiguruj arkusze
-   i użyj w aplikacji desktopowej **Testuj API**.
-7. Przyłóż kartę pracownika. Karta bez uprawnienia przekaźnika rejestruje
-   automatycznie wejście albo wyjście; karta z tym uprawnieniem wyświetla
-   wybór czynności.
+The **Wallpaper** tab lets you fit an image to the 480 × 320 display, preview
+interface fields on the home screen and attendance confirmation, and save
+`WALLPAPER.RGB565` to the SD card. The export also includes
+`wallpaper_rgb565.h` and a `wallpaper_layout.json` area template. These areas
+are only a preview of the firmware's fixed layout; they do not change the
+position of display elements.
 
-Menu ustawień i dodawanie pracowników są chronione PIN-em. Lista pracowników
-umożliwia zmianę dostępu do przekaźnika albo dezaktywację wpisu, która zachowuje
-historię obecności.
+## First terminal startup
 
-## Przygotowanie Google Apps Script
+1. Build and flash the firmware as described below.
+2. Insert an SD card prepared with the desktop application. In offline mode,
+   the terminal can start with an empty employee list.
+3. On first startup, touch each of the four calibration points in sequence.
+   Calibration can be repeated later from settings.
+4. Touch **SETTINGS** on the home screen and enter the default PIN, `0000`.
+   Change it before normal operation.
+5. Add employees in the desktop application or at the terminal. To enroll
+   someone at the device, scan an unknown card, choose **Yes**, enter the PIN,
+   and fill in the ID, first name, and surname. Relay access can also be
+   granted.
+6. For online mode, install the Apps Script described below, configure the
+   spreadsheets, and use **Test API** in the desktop application.
+7. Scan an employee card. Cards without relay permission automatically record
+   entry or exit; cards with relay permission display an action selection.
 
-Szczegółowa procedura i wymagane właściwości projektu są opisane w
-[architekturze](./docs/ARCHITECTURE.md). W skrócie: wgraj
-`google_apps_script/Code.gs` do projektu Apps Script, utwórz wymagane nagłówki
-arkuszy, ustaw token i identyfikatory dokumentów w Script Properties, wdroż
-web app jako właściciel i wklej URL `/exec` do konfiguratora. Następnie użyj
-**Testuj API**.
+Settings and employee enrollment are protected by a PIN. Employee management
+can change relay access or deactivate an entry while preserving its
+attendance history.
 
-Publiczne linki Arkuszy Google służą do identyfikacji arkuszy. Sam CSV/URL nie
-umożliwia bezpiecznego dopisywania rekordów, dlatego terminal zapisuje przez
-chronione tokenem API Apps Script. Hasło Wi-Fi i token są przechowywane jawnie
-na karcie SD — zabezpiecz ją fizycznie.
+## Google Apps Script setup
 
-## Budowanie firmware
+See the [architecture guide](./docs/ARCHITECTURE.md) for the full procedure
+and required project properties. In brief, add `google_apps_script/Code.gs` to
+an Apps Script project, create the required spreadsheet headers, set the token
+and spreadsheet IDs in Script Properties, deploy the web app as its owner, and
+paste the `/exec` URL into the application. Then choose **Test API**.
 
-Polecenia uruchamiaj z katalogu głównego repozytorium:
+Public Google Sheets links identify the spreadsheets. A CSV or URL alone
+cannot securely append records, so the terminal writes through the
+Apps-Script API protected by a token. The Wi-Fi password and token are stored
+in plain text on the SD card; keep the card physically secure.
+
+## Building the firmware
+
+Run these commands from the repository root:
 
 ```powershell
 py -m platformio run -e esp32-s3-devkitc-1-n16r8
 py -m platformio run -e esp32-s3-devkitc-1-n16r8 -t upload --upload-port COMx
 ```
 
-Zamknij monitor szeregowy przed wgrywaniem, aby zwolnić port COM. Pinout jest
-zdefiniowany w [`include/pins.h`](./include/pins.h); szczegóły sprzętowe i
-schematy danych opisuje [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md).
+Close the serial monitor before flashing to release the COM port. The pinout is
+defined in [`include/pins.h`](./include/pins.h); data formats and schemas are
+described in [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md).
 
-## Sprawdzenie zmian
+## Verification
 
 ```powershell
 py -m unittest discover -s desktop\tests -v
@@ -166,15 +173,14 @@ py -m ruff check desktop\src desktop\tests
 py -m platformio run -e esp32-s3-devkitc-1-n16r8
 ```
 
-Kompilacja nie zastępuje testu na urządzeniu. Pierwsze uruchomienie wymaga
-sprawdzenia dotyku, resetu GPIO3, magistral SPI dla SD/RFID/ekranu, RTC, kamery
-i bezpiecznego sterowania rzeczywistym przekaźnikiem.
+Compilation does not replace testing on the device. Initial hardware testing
+should cover touch, GPIO3 reset, SPI buses for the SD card, RFID reader and
+display, RTC, camera, and safe operation of the physical relay.
 
-## Bezpieczeństwo i dane lokalne
+## Security and local data
 
-Nie przechowuj w repozytorium prawdziwego `config.json`, tokenu Apps Script,
-hasła Wi-Fi, prywatnych danych pracowników, logów urządzenia ani zdjęć. Plik
-[`data/config.example.json`](./data/config.example.json) zawiera wyłącznie
-puste wartości przykładowe. Rzeczywisty `config.json` zapisuj na karcie SD,
-którą należy fizycznie zabezpieczyć. Zmień domyślny PIN `0000` przy pierwszym
-uruchomieniu.
+Do not store a real `config.json`, Apps Script token, Wi-Fi password, private
+employee data, device logs, or photos in the repository.
+[`data/config.example.json`](./data/config.example.json) contains only empty
+example values. Store the real `config.json` on the SD card and keep the card
+physically secure. Change the default PIN, `0000`, on first startup.
