@@ -9,6 +9,12 @@ The project includes the terminal firmware, a desktop application, and Google
 Sheets integration. The terminal interface supports Polish, English, Spanish,
 and German.
 
+## Important links
+
+- [Polish user manual](./MANUAL.PDF)
+- [English user manual](./MANUAL_EN.PDF)
+- [Download the Windows desktop application](https://github.com/promirbud-hash/RCP2027/releases/download/desktop-v0.1.0/RCP2027.exe)
+
 ## System components
 
 - `src/`, `include/`, `boards/`, `platformio.ini` — the PlatformIO firmware,
