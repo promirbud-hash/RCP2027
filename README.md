@@ -13,7 +13,7 @@ and German.
 
 - [Polish user manual](./MANUAL.PDF)
 - [English user manual](./MANUAL_EN.PDF)
-- [Download the Windows desktop application](https://github.com/promirbud-hash/RCP2027/releases/download/desktop-v0.1.0/RCP2027.exe)
+- [Download the Windows desktop application](https://github.com/promirbud-hash/RCP2027/releases/latest/download/RCP2027.exe)
 
 ## System components
 
@@ -99,6 +99,10 @@ First, select the SD card's root directory (for example, `E:\`) and choose
 files with headers, and creates the `photos` directory. Existing CSV files and
 records are preserved. Missing CSV files are also created automatically when
 an SD card directory is selected.
+On the terminal's first successful boot, the firmware creates
+`config.json.bak` as an emergency copy. If `config.json` is later missing or
+invalid, the firmware attempts to load and restore the backup. Keep both files
+on the card; the desktop application does not create or manage the backup.
 
 Offline mode can start with an empty employee list; add the first card at the
 terminal or in the desktop application. To view attendance records or logs,
@@ -144,6 +148,26 @@ position of display elements.
 Settings and employee enrollment are protected by a PIN. Employee management
 can change relay access or deactivate an entry while preserving its
 attendance history.
+
+## Factory reset
+
+As an alternative, create an empty `reset.txt` file in the root of the SD card.
+Its contents are ignored. At startup the terminal removes the file, erases NVS,
+and restarts; touchscreen calibration then starts. The file must be removable
+and the SD card must mount successfully.
+
+To clear the terminal's NVS settings, press and release the board's `RST`/`EN`
+button three times. The next reset must occur 1–2 seconds after the previous
+one. The sequence is accepted only for external resets; watchdog resets,
+software restarts, brownouts, and cold power-on boots cancel it. Some ESP32-S3
+boards report an `EN` reset as power-on; this is accepted only if the RTC
+sequence state was retained. The counter is kept in RTC no-init memory (not
+written to flash) and is cleared after five seconds of stable operation.
+
+On the third qualifying reset, the firmware erases NVS and restarts. The
+missing touchscreen calibration is then detected and calibration starts during
+boot. This clears settings stored in NVS, including the PIN and touch
+calibration, but does not erase SD-card files or attendance records.
 
 ## Google Apps Script setup
 

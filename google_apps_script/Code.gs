@@ -1,5 +1,8 @@
 function doPost(event) {
   try {
+    if (!event || !event.postData || !event.postData.contents) {
+      throw new Error("missing_request_body");
+    }
     const request = JSON.parse(event.postData.contents);
     authorize_(request.token);
     const action = request.action;
@@ -14,6 +17,7 @@ function doPost(event) {
         properties.getProperty("LOGS_SHEET_ID")
       ];
       if (!Array.isArray(request.sheet_ids) ||
+          request.sheet_ids.length !== expectedIds.length ||
           request.sheet_ids.some((id, index) => id !== expectedIds[index])) {
         throw new Error("sheet_link_ids_do_not_match_script_properties");
       }
@@ -23,7 +27,7 @@ function doPost(event) {
       return readResponse_("EMPLOYEES_SHEET_ID");
     }
     if (action === "lastAttendance") {
-      return json_({ ok: true, last_event_type: lastEventFor_(request.employee_id) });
+      return lastAttendanceResponse_(request.employee_id);
     }
     if (action === "eventStatus") {
       return attendanceEventStatus_(request.event_id);
@@ -72,24 +76,49 @@ const ATTENDANCE_HEADERS = [
 ];
 const LOG_HEADERS = ["event_id", "timestamp", "level", "code", "message"];
 
+function constantTimeEquals_(left, right) {
+  const a = String(left);
+  const b = String(right);
+  let diff = a.length ^ b.length;
+  const maxLen = Math.max(a.length, b.length);
+  for (let i = 0; i < maxLen; ++i) {
+    diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  }
+  return diff === 0;
+}
+
 function authorize_(provided) {
   const expected = PropertiesService.getScriptProperties().getProperty("RCP_API_TOKEN");
-  if (!expected || !provided || provided !== expected) {
+  if (!expected || typeof provided !== "string" || !provided ||
+      !constantTimeEquals_(provided, expected)) {
     throw new Error("unauthorized");
   }
 }
 
-function readSheet_(propertyName) {
-  const id = PropertiesService.getScriptProperties().getProperty(propertyName);
-  if (!id) throw new Error("missing_sheet_configuration:" + propertyName);
-  const values = SpreadsheetApp.openById(id).getSheets()[0].getDataRange().getDisplayValues();
-  if (values.length < 2) return [];
-  const headers = values[0];
-  return values.slice(1).filter(row => row.some(value => value !== "")).map(row => {
-    const record = {};
-    headers.forEach((header, index) => record[header] = row[index] || "");
-    return record;
-  });
+function appendRowAsText_(sheet, rowValues) {
+  const targetRow = sheet.getLastRow() + 1;
+  const range = sheet.getRange(targetRow, 1, 1, rowValues.length);
+  range.setNumberFormat("@");
+  range.setValues([rowValues]);
+}
+
+function computeRevision_(spreadsheetId, values) {
+  const digest = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    JSON.stringify({ spreadsheet: spreadsheetId, sheet: values }),
+    Utilities.Charset.UTF_8
+  );
+  return Utilities.base64EncodeWebSafe(digest).replace(/=+$/, "");
+}
+
+function lastAttendanceResponse_(employeeId) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(5000);
+  try {
+    return json_({ ok: true, last_event_type: lastEventFor_(employeeId) });
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function readResponse_(propertyName) {
@@ -102,27 +131,39 @@ function readResponse_(propertyName) {
       LOGS_SHEET_ID: LOG_HEADERS
     }[propertyName];
     if (!expected) throw new Error("unsupported_sheet");
-    verifySheet_(propertyName, expected);
+    const id = PropertiesService.getScriptProperties().getProperty(propertyName);
+    if (!id) throw new Error("missing_sheet_configuration:" + propertyName);
+    const sheet = SpreadsheetApp.openById(id).getSheets()[0];
+    if (sheet.getLastRow() === 0) throw new Error("sheet_has_no_header:" + propertyName);
+    const values = sheet.getDataRange().getDisplayValues();
+    if (values[0].length !== expected.length ||
+        values[0].join("\u001f") !== expected.join("\u001f")) {
+      throw new Error("sheet_header_mismatch:" + propertyName);
+    }
+    const headers = values[0];
+    const rows = values.slice(1)
+      .filter(row => row.some(value => value !== ""))
+      .map(row => {
+        const record = {};
+        headers.forEach((header, index) => record[header] = row[index] || "");
+        return record;
+      });
     return json_({
       ok: true,
-      rows: readSheet_(propertyName),
-      revision: sheetRevision_(propertyName)
+      rows: rows,
+      revision: computeRevision_(id, values)
     });
   } finally {
     lock.releaseLock();
   }
 }
 
-function sheetRevision_(propertyName) {
+function sheetRevision_(propertyName, sheet) {
   const id = PropertiesService.getScriptProperties().getProperty(propertyName);
   if (!id) throw new Error("missing_sheet_configuration:" + propertyName);
-  const values = SpreadsheetApp.openById(id).getSheets()[0].getDataRange().getDisplayValues();
-  const digest = Utilities.computeDigest(
-    Utilities.DigestAlgorithm.SHA_256,
-    JSON.stringify({ spreadsheet: id, sheet: values }),
-    Utilities.Charset.UTF_8
-  );
-  return Utilities.base64EncodeWebSafe(digest).replace(/=+$/, "");
+  const targetSheet = sheet || SpreadsheetApp.openById(id).getSheets()[0];
+  const values = targetSheet.getDataRange().getDisplayValues();
+  return computeRevision_(id, values);
 }
 
 function verifySheet_(propertyName, expectedHeaders) {
@@ -146,7 +187,7 @@ function append_(propertyName, headers, row) {
   try {
     const sheet = SpreadsheetApp.openById(id).getSheets()[0];
     if (sheet.getLastRow() === 0) {
-      sheet.appendRow(headers);
+      appendRowAsText_(sheet, headers);
     }
     const sheetHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getDisplayValues()[0];
     verifyHeaders_(sheet, headers);
@@ -167,7 +208,7 @@ function append_(propertyName, headers, row) {
         });
       }
     }
-    sheet.appendRow(sheetHeaders.map(header =>
+    appendRowAsText_(sheet, sheetHeaders.map(header =>
       safeCell_(row[header] === undefined ? "" : row[header])
     ));
     if (propertyName === "ATTENDANCE_SHEET_ID" &&
@@ -218,7 +259,7 @@ function registerEmployee_(row) {
           : "card_uid_already_exists");
       }
     }
-    sheet.appendRow(EMPLOYEE_HEADERS.map(header =>
+    appendRowAsText_(sheet, EMPLOYEE_HEADERS.map(header =>
       safeCell_(row[header] === undefined ? "" : row[header])
     ));
     PropertiesService.getScriptProperties().deleteProperty(lastEventKey_(row.employee_id));
@@ -250,11 +291,17 @@ function updateEmployee_(row) {
         const headers = values[0];
         const activeColumn = headers.indexOf("active") + 1;
         const relayColumn = headers.indexOf("relay_access") + 1;
-        sheet.getRange(index + 1, activeColumn).setValue(String(row.active).toLowerCase() === "true" ||
-          String(row.active) === "1");
-        sheet.getRange(index + 1, relayColumn).setValue(String(row.relay_access).toLowerCase() === "true" ||
-          String(row.relay_access) === "1");
-        if (String(row.active).toLowerCase() !== "true" && String(row.active) !== "1") {
+        const isActive = String(row.active).toLowerCase() === "true" ||
+          String(row.active) === "1";
+        const hasRelay = String(row.relay_access).toLowerCase() === "true" ||
+          String(row.relay_access) === "1";
+        const activeRange = sheet.getRange(index + 1, activeColumn);
+        activeRange.setNumberFormat("@");
+        activeRange.setValue(isActive ? "true" : "false");
+        const relayRange = sheet.getRange(index + 1, relayColumn);
+        relayRange.setNumberFormat("@");
+        relayRange.setValue(hasRelay ? "true" : "false");
+        if (!isActive) {
           PropertiesService.getScriptProperties().deleteProperty(lastEventKey_(row.employee_id));
         }
         return json_({ ok: true });
@@ -294,7 +341,7 @@ function recordPunch_(row) {
     const eventType = previous === "ENTRY" ? "EXIT" : "ENTRY";
     row.event_type = eventType;
     validateRow_(ATTENDANCE_HEADERS, row);
-    sheet.appendRow(ATTENDANCE_HEADERS.map(header =>
+    appendRowAsText_(sheet, ATTENDANCE_HEADERS.map(header =>
       safeCell_(row[header] === undefined ? "" : row[header])
     ));
     PropertiesService.getScriptProperties().setProperty(
@@ -328,6 +375,7 @@ function findAttendanceByEventId_(sheet, eventId) {
   if (!String(eventId || "").trim() || sheet.getLastRow() < 2) return null;
   const match = sheet.getRange(2, 1, sheet.getLastRow() - 1, 1)
     .createTextFinder(String(eventId))
+    .matchCase(true)
     .matchEntireCell(true)
     .findNext();
   if (!match) return null;
@@ -339,8 +387,10 @@ function findAttendanceByEventId_(sheet, eventId) {
 }
 
 function assertSameAttendanceRequest_(existing, request) {
-  if (String(existing.employee_id) !== String(request.employee_id) ||
-      String(existing.card_uid).toUpperCase() !== String(request.card_uid).toUpperCase() ||
+  if (String(existing.employee_id).trim().toLowerCase() !==
+        String(request.employee_id).trim().toLowerCase() ||
+      String(existing.card_uid).trim().toUpperCase() !==
+        String(request.card_uid).trim().toUpperCase() ||
       (request.event_type && existing.event_type !== request.event_type)) {
     throw new Error("event_id_conflict");
   }
@@ -371,7 +421,7 @@ function replace_(propertyName, headers, rows, expectedRevision) {
   lock.waitLock(5000);
   try {
     const sheet = SpreadsheetApp.openById(id).getSheets()[0];
-    if (sheetRevision_(propertyName) !== expectedRevision) {
+    if (sheetRevision_(propertyName, sheet) !== expectedRevision) {
       throw new Error("sheet_changed_refresh_before_retry");
     }
     if (sheet.getLastRow() > 0) {
@@ -384,7 +434,9 @@ function replace_(propertyName, headers, rows, expectedRevision) {
     const values = [headers].concat(rows.map(row =>
       headers.map(header => safeCell_(row[header] === undefined ? "" : row[header]))
     ));
-    sheet.getRange(1, 1, values.length, headers.length).setValues(values);
+    const targetRange = sheet.getRange(1, 1, values.length, headers.length);
+    targetRange.setNumberFormat("@");
+    targetRange.setValues(values);
     if (sheet.getLastRow() > values.length) {
       sheet.getRange(values.length + 1, 1, sheet.getLastRow() - values.length,
         headers.length).clearContent();
@@ -394,7 +446,7 @@ function replace_(propertyName, headers, rows, expectedRevision) {
     return json_({
       ok: true,
       count: rows.length,
-      revision: sheetRevision_(propertyName)
+      revision: sheetRevision_(propertyName, sheet)
     });
   } finally {
     lock.releaseLock();
@@ -444,16 +496,18 @@ function isTimestamp_(value) {
 }
 
 function lastEventKey_(employeeId) {
+  const normalized = String(employeeId).trim().toLowerCase();
   const digest = Utilities.computeDigest(
-    Utilities.DigestAlgorithm.SHA_256, String(employeeId), Utilities.Charset.UTF_8
+    Utilities.DigestAlgorithm.SHA_256, normalized, Utilities.Charset.UTF_8
   );
   return "LAST_EVENT_" + Utilities.base64EncodeWebSafe(digest).replace(/=+$/, "");
 }
 
 function lastEventFor_(employeeId, sheet) {
-  if (!employeeId) throw new Error("employee_id_required");
+  const normalized = String(employeeId || "").trim().toLowerCase();
+  if (!normalized) throw new Error("employee_id_required");
   const properties = PropertiesService.getScriptProperties();
-  const key = lastEventKey_(employeeId);
+  const key = lastEventKey_(normalized);
   const cached = properties.getProperty(key);
   if (cached !== null) return cached;
   const attendanceId = properties.getProperty("ATTENDANCE_SHEET_ID");
@@ -463,7 +517,7 @@ function lastEventFor_(employeeId, sheet) {
   }
   const values = sheet.getDataRange().getDisplayValues();
   for (let index = values.length - 1; index > 0; --index) {
-    if (values[index][2] === String(employeeId) &&
+    if (String(values[index][2]).trim().toLowerCase() === normalized &&
         (values[index][4] === "ENTRY" || values[index][4] === "EXIT")) {
       properties.setProperty(key, values[index][4]);
       return values[index][4];
@@ -475,12 +529,15 @@ function lastEventFor_(employeeId, sheet) {
 
 function rebuildLastEvents_(rows) {
   clearLastEvents_();
-  const properties = PropertiesService.getScriptProperties();
+  const updates = {};
   rows.forEach(row => {
     if (row.event_type === "ENTRY" || row.event_type === "EXIT") {
-      properties.setProperty(lastEventKey_(row.employee_id), row.event_type);
+      updates[lastEventKey_(row.employee_id)] = row.event_type;
     }
   });
+  if (Object.keys(updates).length > 0) {
+    PropertiesService.getScriptProperties().setProperties(updates, false);
+  }
 }
 
 function clearLastEvents_() {
@@ -491,7 +548,7 @@ function clearLastEvents_() {
 
 function safeCell_(value) {
   const text = String(value);
-  return /^[=+\-@]/.test(text) ? "'" + text : text;
+  return /^[\s\t\r]*[=+\-@]/.test(text) ? "'" + text : text;
 }
 
 function json_(value) {

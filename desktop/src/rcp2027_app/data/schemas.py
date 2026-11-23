@@ -8,6 +8,7 @@ import secrets
 import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from http.client import HTTPException
 from pathlib import Path
 from typing import Iterable
 from urllib.error import HTTPError, URLError
@@ -55,14 +56,39 @@ class DeviceConfig:
     camera_enabled: bool = False
 
     def validate(self) -> None:
-        if self.schema_version != 1:
+        if isinstance(self.schema_version, bool) or self.schema_version != 1:
             raise ValueError("Nieobsługiwana wersja pliku konfiguracji.")
+        for field_name in (
+            "mode",
+            "language",
+            "wifi_ssid",
+            "wifi_password",
+            "apps_script_url",
+            "api_token",
+            "employees_sheet_url",
+            "attendance_sheet_url",
+            "logs_sheet_url",
+        ):
+            if not isinstance(getattr(self, field_name), str):
+                raise ValueError(f"Pole konfiguracji {field_name} musi być tekstem.")
+        if not isinstance(self.camera_enabled, bool):
+            raise ValueError("Pole camera_enabled musi mieć wartość logiczną true/false.")
+        if (
+            isinstance(self.timezone_offset_minutes, bool)
+            or not isinstance(self.timezone_offset_minutes, int)
+        ):
+            raise ValueError("Przesunięcie strefy czasowej musi być liczbą całkowitą.")
         if self.mode not in {"offline", "online"}:
             raise ValueError("Tryb musi mieć wartość offline albo online.")
         if self.language not in {"pl", "en", "es", "de"}:
             raise ValueError("Nieobsługiwany język.")
-        if len(self.wifi_ssid) > 32 or len(self.wifi_password) > 63:
-            raise ValueError("SSID lub hasło Wi-Fi przekracza dopuszczalną długość.")
+        if (
+            len(self.wifi_ssid.encode("utf-8")) > 32
+            or len(self.wifi_password.encode("utf-8")) > 63
+        ):
+            raise ValueError(
+                "SSID (maks. 32 B UTF-8) lub hasło Wi-Fi (maks. 63 B UTF-8) przekracza limit."
+            )
         if not -720 <= self.timezone_offset_minutes <= 840:
             raise ValueError("Przesunięcie strefy czasowej musi być w zakresie UTC-12 do UTC+14.")
         if self.mode == "online":
@@ -145,11 +171,19 @@ def validate_attendance_rows(rows: list[dict[str, str]]) -> None:
             raise ValueError(f"attendance.csv, wiersz {index}: brak pracownika lub UID karty.")
         if row.get("event_type", "") not in {"ENTRY", "EXIT"}:
             raise ValueError(f"attendance.csv, wiersz {index}: event_type musi być ENTRY/EXIT.")
+        timestamp = row.get("timestamp", "")
+        if not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})",
+            timestamp,
+        ):
+            raise ValueError(
+                f"attendance.csv, wiersz {index}: timestamp musi być w formacie ISO 8601 ze strefą (np. 2026-10-06T08:00:00+02:00)."
+            )
         try:
-            datetime.fromisoformat(row.get("timestamp", ""))
+            datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
         except ValueError as error:
             raise ValueError(
-                f"attendance.csv, wiersz {index}: timestamp musi być ISO 8601."
+                f"attendance.csv, wiersz {index}: timestamp musi być poprawną datą ISO 8601."
             ) from error
         event_ids.add(event_id)
 
@@ -193,7 +227,15 @@ def apps_script_request(
     try:
         with urlopen(request, timeout=timeout) as response:
             body = json.load(response)
-    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as error:
+    except (
+        HTTPError,
+        URLError,
+        HTTPException,
+        OSError,
+        TimeoutError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as error:
         raise ValueError(f"Nie udało się sprawdzić Apps Script: {error}") from error
     if not isinstance(body, dict):
         raise ValueError("Apps Script zwrócił nieprawidłową odpowiedź.")
@@ -257,14 +299,12 @@ def initialize_sd_csv_files(folder: Path) -> tuple[Path, ...]:
     created_paths = []
     for filename, fields in csv_files:
         path = folder / filename
-        if path.exists():
+        if path.exists() and path.stat().st_size > 0:
             rows = load_csv(folder, filename, fields)
             if filename == EMPLOYEES_FILE:
                 validate_employee_rows(rows)
             elif filename == ATTENDANCE_FILE:
                 validate_attendance_rows(rows)
-            if path.stat().st_size == 0:
-                created_paths.append(save_csv(folder, filename, fields, ()))
         else:
             created_paths.append(save_csv(folder, filename, fields, ()))
     return tuple(created_paths)
@@ -295,11 +335,11 @@ def load_csv_file(path: Path, fields: tuple[str, ...]) -> list[dict[str, str]]:
             raise ValueError(f"{path.name}: niezgodny nagłówek CSV.")
         rows = []
         for row in reader:
-            if None in row:
+            if None in row or any(row.get(field) is None for field in fields):
                 raise ValueError(
                     f"{path.name}: rekord ma inną liczbę kolumn niż nagłówek."
                 )
-            rows.append({field: row.get(field, "") or "" for field in fields})
+            rows.append({field: row[field] for field in fields})
         return rows
 
 

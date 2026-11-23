@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from http.client import RemoteDisconnected
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -206,6 +207,81 @@ class SchemaTests(unittest.TestCase):
             self.assertEqual(load_csv(folder, ATTENDANCE_FILE, ATTENDANCE_FIELDS), [])
             self.assertEqual(load_csv(folder, LOGS_FILE, LOG_FIELDS), [])
             self.assertEqual(initialize_sd_csv_files(folder), ())
+
+    def test_initialize_sd_csv_files_writes_headers_to_zero_byte_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            (folder / EMPLOYEES_FILE).write_bytes(b"")
+            (folder / ATTENDANCE_FILE).write_bytes(b"")
+
+            created_paths = initialize_sd_csv_files(folder)
+
+            self.assertEqual(
+                {path.name for path in created_paths},
+                {EMPLOYEES_FILE, ATTENDANCE_FILE, LOGS_FILE},
+            )
+            self.assertEqual(load_csv(folder, EMPLOYEES_FILE, EMPLOYEE_FIELDS), [])
+            self.assertEqual(load_csv(folder, ATTENDANCE_FILE, ATTENDANCE_FIELDS), [])
+
+    def test_load_csv_rejects_truncated_row(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / EMPLOYEES_FILE
+            path.write_text(
+                "employee_id,card_uid,first_name,last_name,active,relay_access\n"
+                "E-1,A1B2,Ada\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "inną liczbę kolumn"):
+                load_csv_file(path, EMPLOYEE_FIELDS)
+
+    def test_load_config_rejects_invalid_json_field_types(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            for payload in (
+                {"schema_version": 1, "mode": "offline", "language": "pl", "camera_enabled": "false"},
+                {"schema_version": 1, "mode": "offline", "language": "pl", "timezone_offset_minutes": "60"},
+                {"schema_version": True, "mode": "offline", "language": "pl"},
+                {"schema_version": 1, "mode": "offline", "language": "pl", "wifi_ssid": 123},
+            ):
+                with self.subTest(payload=payload):
+                    (folder / "config.json").write_text(json.dumps(payload), encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        load_config(folder)
+
+    def test_wifi_ssid_validates_utf8_byte_length(self) -> None:
+        # 17 Polish characters = 34 UTF-8 bytes (> 32 byte 802.11 limit)
+        with self.assertRaisesRegex(ValueError, "UTF-8"):
+            DeviceConfig(wifi_ssid="ł" * 17).validate()
+        DeviceConfig(wifi_ssid="ł" * 16).validate()
+
+    def test_attendance_timestamp_requires_explicit_utc_offset(self) -> None:
+        base = {
+            "event_id": "ev-1",
+            "timestamp": "2026-10-06T08:00:00Z",
+            "employee_id": "E-1",
+            "card_uid": "A1B2",
+            "event_type": "ENTRY",
+            "photo_file": "",
+            "source": "manual",
+            "notes": "",
+        }
+        validate_attendance_rows([base])
+        for bad_timestamp in ("2026-10-06", "2026-10-06T08:00:00", "2026-10-06 08:00:00+02:00"):
+            with self.subTest(timestamp=bad_timestamp), self.assertRaisesRegex(
+                ValueError, "ISO 8601"
+            ):
+                validate_attendance_rows([{**base, "timestamp": bad_timestamp}])
+
+    def test_apps_script_wraps_http_exception_as_value_error(self) -> None:
+        with patch(
+            "rcp2027_app.data.schemas.urlopen",
+            side_effect=RemoteDisconnected("connection closed"),
+        ), self.assertRaisesRegex(ValueError, "Apps Script"):
+            apps_script_request(
+                "https://script.google.com/macros/s/deployment/exec",
+                "x" * 32,
+                "ping",
+            )
 
 
 if __name__ == "__main__":

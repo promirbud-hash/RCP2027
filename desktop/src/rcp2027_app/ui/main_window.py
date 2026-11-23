@@ -7,6 +7,7 @@ from typing import Callable
 from PySide6.QtCore import QThread, QRect, Signal, Qt
 from PySide6.QtGui import QColor, QFontDatabase, QImage, QPainter, QPen
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -131,7 +132,7 @@ class _AppsScriptWorker(QThread):
     def run(self) -> None:
         try:
             result = self._operation()
-        except (OSError, ValueError) as error:
+        except Exception as error:
             self.failed.emit(str(error))
             return
         self.succeeded.emit(result)
@@ -147,6 +148,7 @@ class MainWindow(QMainWindow):
         self.csv_paths: dict[str, Path] = {}
         self._api_worker: _AppsScriptWorker | None = None
         self._api_buttons: list[QPushButton] = []
+        self._api_generation = 0
 
         tabs = QTabWidget()
         tabs.addTab(self._configuration_page(), "Konfiguracja i karta SD")
@@ -205,6 +207,7 @@ class MainWindow(QMainWindow):
         self.mode = QComboBox()
         self.mode.addItem("Offline — karta SD", "offline")
         self.mode.addItem("Online — Arkusze Google", "online")
+        self.mode.currentIndexChanged.connect(self._on_mode_changed)
         self.language = QComboBox()
         for label, code in (
             ("Polski", "pl"),
@@ -280,6 +283,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         self.wallpaper_image = QImage()
         self._wallpaper_source_path: str | None = None
+        self._wallpaper_cached_key: tuple[str, str] | None = None
         self.wallpaper_output_dir: Path | None = None
 
         controls = QHBoxLayout()
@@ -344,29 +348,31 @@ class MainWindow(QMainWindow):
         )
         if not filename:
             return
+        sizing = str(self.wallpaper_sizing.currentData())
         try:
-            self.wallpaper_image = make_wallpaper_image(
-                filename, str(self.wallpaper_sizing.currentData())
-            )
+            self.wallpaper_image = make_wallpaper_image(filename, sizing)
         except (OSError, ValueError) as error:
             self._show_error(str(error))
             return
         self._wallpaper_source_path = filename
+        self._wallpaper_cached_key = (filename, sizing)
         self.wallpaper_source_label.setText(Path(filename).name)
         self._refresh_wallpaper_preview()
 
     def _refresh_wallpaper_preview(self, *_args) -> None:
         if self.wallpaper_image.isNull() or self._wallpaper_source_path is None:
             return
-        try:
-            image = make_wallpaper_image(
-                self._wallpaper_source_path,
-                str(self.wallpaper_sizing.currentData()),
-            )
-        except (OSError, ValueError) as error:
-            self.wallpaper_status.setText(f"Nie można przygotować podglądu: {error}")
-            return
-        self.wallpaper_image = image
+        sizing = str(self.wallpaper_sizing.currentData())
+        cache_key = (self._wallpaper_source_path, sizing)
+        if cache_key != self._wallpaper_cached_key:
+            try:
+                self.wallpaper_image = make_wallpaper_image(
+                    self._wallpaper_source_path, sizing
+                )
+            except (OSError, ValueError) as error:
+                self.wallpaper_status.setText(f"Nie można przygotować podglądu: {error}")
+                return
+            self._wallpaper_cached_key = cache_key
         zones = WALLPAPER_ZONES[str(self.wallpaper_screen.currentData())]
         visible_ids = {
             self.wallpaper_zone_list.item(index).data(Qt.ItemDataRole.UserRole)
@@ -374,7 +380,7 @@ class MainWindow(QMainWindow):
             if self.wallpaper_zone_list.item(index).checkState()
             == Qt.CheckState.Checked
         }
-        self.wallpaper_preview.set_preview(image, zones, visible_ids)
+        self.wallpaper_preview.set_preview(self.wallpaper_image, zones, visible_ids)
 
     def _refresh_wallpaper_zones(self, *_args) -> None:
         if not hasattr(self, "wallpaper_zone_list"):
@@ -431,6 +437,8 @@ class MainWindow(QMainWindow):
         table.setHorizontalHeaderLabels(fields)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         table.setAlternatingRowColors(True)
+        if not editable:
+            table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         layout.addWidget(table)
         controls = QHBoxLayout()
         if select_csv:
@@ -467,6 +475,10 @@ class MainWindow(QMainWindow):
         layout.addLayout(controls)
         tabs.addTab(page, title)
         return table
+
+    def _on_mode_changed(self, *_args) -> None:
+        self._api_generation += 1
+        self.remote_revisions.clear()
 
     def _refresh_table(
         self,
@@ -512,13 +524,31 @@ class MainWindow(QMainWindow):
                 self._show_error,
             )
             return
+        selected_path = self.csv_paths.get(filename)
+        if selected_path is not None:
+            try:
+                rows = load_csv_file(selected_path, fields)
+            except (OSError, ValueError) as error:
+                self._show_error(str(error))
+                return
+            self._set_table_rows(table, fields, rows)
+            self.status.setText(f"Odświeżono {len(rows)} rekordów z {selected_path}.")
+            return
+        if self.folder is None:
+            self._show_error("Najpierw wybierz katalog karty SD.")
+            return
+        default_path = self.folder / filename
         self._load_table(table, fields, filename)
+        if default_path.exists():
+            self.csv_paths[filename] = default_path
 
     def _choose_folder(self) -> None:
         selected = QFileDialog.getExistingDirectory(self, "Wybierz katalog karty SD")
         if not selected:
             return
-        self.folder = Path(selected)
+        folder = Path(selected)
+        self._api_generation += 1
+        self.folder = folder
         self.remote_revisions.clear()
         self.csv_paths.clear()
         self.folder_label.setText(str(self.folder))
@@ -531,6 +561,9 @@ class MainWindow(QMainWindow):
             self.attendance_table.setRowCount(0)
             self.log_table.setRowCount(0)
         except (OSError, ValueError) as error:
+            self.employee_table.setRowCount(0)
+            self.attendance_table.setRowCount(0)
+            self.log_table.setRowCount(0)
             self._show_error(str(error))
         else:
             self._put_config(config)
@@ -539,18 +572,19 @@ class MainWindow(QMainWindow):
                 if created_csvs
                 else ""
             )
-            self.status.setText(f"Wczytano config.json.{created_message}")
             if config.mode == "offline":
                 self._load_table(self.employee_table, EMPLOYEE_FIELDS, EMPLOYEES_FILE)
                 self.attendance_table.setRowCount(0)
                 self.log_table.setRowCount(0)
                 self.status.setText(
-                    "Konfigurację wczytano. Wskaż attendance.csv i logs.csv z karty SD."
+                    f"Wczytano config.json.{created_message} "
+                    "Wskaż attendance.csv i logs.csv z karty SD."
                 )
             else:
                 self.employee_table.setRowCount(0)
                 self.attendance_table.setRowCount(0)
                 self.log_table.setRowCount(0)
+                self.status.setText(f"Wczytano config.json.{created_message}")
 
     def _load_table(
         self, table: QTableWidget, fields: tuple[str, ...], filename: str
@@ -562,10 +596,7 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError) as error:
             self._show_error(str(error))
             return
-        table.setRowCount(len(rows))
-        for row_index, row in enumerate(rows):
-            for column, field in enumerate(fields):
-                table.setItem(row_index, column, QTableWidgetItem(row[field]))
+        self._set_table_rows(table, fields, rows)
 
     def _choose_csv_file(
         self, table: QTableWidget, fields: tuple[str, ...], filename: str
@@ -588,9 +619,9 @@ class MainWindow(QMainWindow):
             self._show_error("Wybierz plik znajdujący się w katalogu wybranej karty SD.")
             return
         try:
-            rows = load_csv_file(path, fields)
             if path.stat().st_size == 0:
                 raise ValueError(f"{path.name}: plik jest pusty i nie zawiera nagłówka CSV.")
+            rows = load_csv_file(path, fields)
         except (OSError, ValueError) as error:
             self._show_error(str(error))
             return
@@ -730,18 +761,25 @@ class MainWindow(QMainWindow):
         if self._api_worker is not None:
             self.status.setText("Poczekaj na zakończenie trwającego żądania.")
             return
+        generation = self._api_generation
         worker = _AppsScriptWorker(operation, self)
         self._api_worker = worker
-        worker.succeeded.connect(on_success)
-        worker.failed.connect(on_error)
-        worker.finished.connect(self._finish_api_worker)
+        worker.succeeded.connect(
+            lambda result: on_success(result) if generation == self._api_generation else None
+        )
+        worker.failed.connect(
+            lambda message: on_error(message) if generation == self._api_generation else None
+        )
+        worker.finished.connect(lambda: self._finish_api_worker(worker))
         for button in self._api_buttons:
             button.setEnabled(False)
         self.status.setText("Łączenie z Google Apps Script…")
         worker.start()
 
-    def _finish_api_worker(self) -> None:
-        self._api_worker = None
+    def _finish_api_worker(self, worker: _AppsScriptWorker) -> None:
+        if self._api_worker is worker:
+            self._api_worker = None
+        worker.deleteLater()
         for button in self._api_buttons:
             button.setEnabled(True)
 
@@ -850,12 +888,18 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _configuration(self) -> DeviceConfig:
+        try:
+            timezone_offset = int(self.timezone_offset.text().strip())
+        except ValueError as error:
+            raise ValueError(
+                "Przesunięcie strefy czasowej musi być liczbą całkowitą w minutach (np. 60)."
+            ) from error
         return DeviceConfig(
             mode=self.mode.currentData(),
             language=self.language.currentData(),
             wifi_ssid=self.ssid.text().strip(),
             wifi_password=self.wifi_password.text(),
-            timezone_offset_minutes=int(self.timezone_offset.text()),
+            timezone_offset_minutes=timezone_offset,
             apps_script_url=self.apps_script.text().strip(),
             api_token=self.api_token.text(),
             employees_sheet_url=self.employees_sheet.text().strip(),
@@ -947,12 +991,18 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 return
         try:
-            paths = prepare_sd_card(self.folder, self._configuration())
+            config = self._configuration()
+            paths = prepare_sd_card(self.folder, config)
         except (OSError, ValueError) as error:
             self._show_error(str(error))
             return
+        self._api_generation += 1
+        self.remote_revisions.clear()
         self.csv_paths.clear()
-        self._load_table(self.employee_table, EMPLOYEE_FIELDS, EMPLOYEES_FILE)
+        if config.mode == "offline":
+            self._load_table(self.employee_table, EMPLOYEE_FIELDS, EMPLOYEES_FILE)
+        else:
+            self.employee_table.setRowCount(0)
         self.attendance_table.setRowCount(0)
         self.log_table.setRowCount(0)
         created = [path.name for path in paths[1:]]

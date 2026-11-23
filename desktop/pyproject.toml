@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rcp2027-desktop"
-version = "0.1.0"
+version = "0.1.1"
 description = "Desktop companion application for the RCP2027 time recorder"
 requires-python = ">=3.10"
 dependencies = [

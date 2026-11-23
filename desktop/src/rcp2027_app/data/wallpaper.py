@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
+import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt
@@ -67,10 +69,15 @@ def wallpaper_rgb565_bytes(image: QImage) -> bytes:
         raise ValueError("Tapeta musi mieć dokładnie 480 × 320 pikseli.")
     rgb565 = image.convertToFormat(QImage.Format.Format_RGB16)
     raw = bytes(rgb565.constBits())
-    expected = WALLPAPER_BYTE_COUNT
-    if len(raw) < expected:
+    row_bytes = WALLPAPER_WIDTH * 2
+    stride = rgb565.bytesPerLine()
+    if stride < row_bytes or len(raw) < stride * WALLPAPER_HEIGHT:
         raise ValueError("Nie udało się odczytać pełnych danych obrazu RGB565.")
-    return raw[:expected]
+    if stride == row_bytes:
+        return raw[:WALLPAPER_BYTE_COUNT]
+    return b"".join(
+        raw[row * stride : row * stride + row_bytes] for row in range(WALLPAPER_HEIGHT)
+    )
 
 
 def wallpaper_c_header(image: QImage) -> bytes:
@@ -101,6 +108,21 @@ def wallpaper_layout_json() -> bytes:
     return (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
 
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("wb", dir=path.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+
+
 def save_wallpaper_assets(directory: str | Path, image: QImage) -> tuple[Path, Path, Path]:
     output_dir = Path(directory)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -108,7 +130,7 @@ def save_wallpaper_assets(directory: str | Path, image: QImage) -> tuple[Path, P
     header_path = output_dir / "wallpaper_rgb565.h"
     layout_path = output_dir / "wallpaper_layout.json"
 
-    raw_path.write_bytes(wallpaper_rgb565_bytes(image))
-    header_path.write_bytes(wallpaper_c_header(image))
-    layout_path.write_bytes(wallpaper_layout_json())
+    _atomic_write_bytes(raw_path, wallpaper_rgb565_bytes(image))
+    _atomic_write_bytes(header_path, wallpaper_c_header(image))
+    _atomic_write_bytes(layout_path, wallpaper_layout_json())
     return raw_path, header_path, layout_path

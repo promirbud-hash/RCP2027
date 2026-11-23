@@ -11,12 +11,16 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <esp_camera.h>
+#include <esp_attr.h>
 #include <esp_heap_caps.h>
+#include <esp_system.h>
 #include <esp_timer.h>
 #include <driver/gpio.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
+#include <nvs_flash.h>
+#include <soc/esp32s3/rtc.h>
 #include <Wire.h>
 #include <cstring>
 #include <cmath>
@@ -39,6 +43,8 @@ constexpr uint32_t kNetworkQueueWaitMs = 100;
 constexpr uint32_t kEmployeeRefreshMs = 300000;
 constexpr uint8_t kMaximumEmployees = 180;
 constexpr char kConfigPath[] = "/config.json";
+constexpr char kConfigBackupPath[] = "/config.json.bak";
+constexpr char kFactoryResetRequestPath[] = "/reset.txt";
 constexpr char kEmployeesPath[] = "/employees.csv";
 constexpr char kAttendancePath[] = "/attendance.csv";
 constexpr char kPendingAttendancePath[] = "/attendance_pending.csv";
@@ -52,6 +58,29 @@ constexpr size_t kWallpaperByteCount = kWallpaperPixelCount * sizeof(uint16_t);
 constexpr uint32_t kTouchCalibrationMagic = 0x52435055;
 constexpr uint32_t kLegacyTouchCalibrationMagic = 0x52435054;
 constexpr int kTouchCalibrationMargin = 30;
+constexpr uint32_t kFactoryResetSequenceMagic = 0x52435053;
+constexpr uint64_t kFactoryResetMinimumIntervalUs = 1000000;
+constexpr uint64_t kFactoryResetMaximumIntervalUs = 2000000;
+constexpr uint32_t kFactoryResetMinimumIntervalSec = 1;
+constexpr uint32_t kFactoryResetMaximumIntervalSec = 3;
+constexpr uint32_t kFactoryResetStablePeriodMs = 5000;
+constexpr size_t kMaxHttpResponseBytes = 131072;
+constexpr uint8_t kMaxPinFailuresBeforeLockout = 5;
+constexpr uint32_t kPinLockoutMs = 30000;
+constexpr uint32_t kActionChoiceTimeoutMs = 30000;
+constexpr uint32_t kUnknownCardTimeoutMs = 30000;
+constexpr uint32_t kAddEmployeeCardTimeoutMs = 60000;
+constexpr uint32_t kSettingsTimeoutMs = 120000;
+
+struct FactoryResetSequenceState {
+    uint32_t magic;
+    uint32_t count;
+    uint64_t lastResetUs;
+    uint32_t lastResetUnix;
+    uint32_t checksum;
+};
+
+RTC_NOINIT_ATTR FactoryResetSequenceState factoryResetSequenceState;
 
 class LGFX_RCP : public lgfx::LGFX_Device {
     lgfx::Panel_ILI9488 panel_;
@@ -152,6 +181,7 @@ struct AttendanceState {
 
 struct NetworkJob {
     uint32_t requestId;
+    String url;
     String body;
     bool responseExpected;
 };
@@ -401,12 +431,21 @@ bool rfidAvailable = false;
 bool cameraAvailable = false;
 esp_err_t cameraInitError = ESP_OK;
 bool configurationValid = false;
+bool configLoadedFromBackup = false;
+bool factoryResetStabilityPending = false;
+uint32_t factoryResetStableSinceMs = 0;
 bool offlineEmployeesLoaded = false;
+bool offlineEmployeesTruncated = false;
 bool onlineEmployeesLoaded = false;
 bool sdFilesInitialized = false;
 bool relayWasActive = false;
 bool networkWorkerReady = false;
 volatile bool relayAutoClosed = false;
+uint8_t pinFailedAttempts = 0;
+uint32_t pinLockedUntilMs = 0;
+bool pendingQueueChecked = false;
+bool pendingQueueHasRows = false;
+bool pendingQueueBlockBannerShown = false;
 String pendingPin;
 String pendingEmployeeUid;
 String newEmployeeId;
@@ -760,33 +799,129 @@ bool ensureCsvFile(const char* path, const char* header) {
     return true;
 }
 
-bool performAppsScriptPost(const String& body, String& responseBody,
-                           bool& responseReceived) {
-    if (WiFi.status() != WL_CONNECTED || config.appsScriptUrl.isEmpty() ||
-        config.apiToken.isEmpty()) return false;
+class BoundedStringStream : public Stream {
+public:
+    BoundedStringStream(String& target, size_t maxBytes)
+        : target_(target), maxBytes_(maxBytes), overflowed_(false) {}
+
+    int available() override { return 0; }
+    int read() override { return -1; }
+    int peek() override { return -1; }
+
+    size_t write(uint8_t byte) override {
+        return write(&byte, 1);
+    }
+
+    size_t write(const uint8_t* buffer, size_t size) override {
+        if (overflowed_ || buffer == nullptr || size == 0) return 0;
+        if (target_.length() + size > maxBytes_) {
+            overflowed_ = true;
+            target_ = "";
+            return 0;
+        }
+        if (!target_.concat(reinterpret_cast<const char*>(buffer),
+                            static_cast<unsigned int>(size))) {
+            overflowed_ = true;
+            target_ = "";
+            return 0;
+        }
+        return size;
+    }
+
+    bool overflowed() const { return overflowed_; }
+
+private:
+    String& target_;
+    size_t maxBytes_;
+    bool overflowed_;
+};
+
+bool isAllowedAppsScriptRedirect(const String& url) {
+    return url.startsWith("https://script.googleusercontent.com/") ||
+           url.startsWith("https://script.google.com/");
+}
+
+bool performAppsScriptPost(const String& url, const String& body,
+                           String& responseBody, bool& responseReceived) {
+    responseBody = "";
+    responseReceived = false;
+    if (WiFi.status() != WL_CONNECTED || url.isEmpty() || body.isEmpty()) {
+        return false;
+    }
     WiFiClientSecure secureClient;
     secureClient.setCACert(kGoogleRootCertificate);
-    HTTPClient http;
-    http.setTimeout(kHttpTimeoutMs);
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    if (!http.begin(secureClient, config.appsScriptUrl)) return false;
-    http.addHeader("Content-Type", "application/json");
-    const int status = http.POST(body);
-    responseReceived = status > 0;
-    if (status < 200 || status >= 300) {
-        Serial.printf("Apps Script HTTP error: %d\n", status);
+
+    const char* headerKeys[] = {"Location"};
+    String currentUrl = url;
+    bool usePost = true;
+
+    for (uint8_t hop = 0; hop < 4; ++hop) {
+        HTTPClient http;
+        http.setTimeout(kHttpTimeoutMs);
+        http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+        http.collectHeaders(headerKeys, 1);
+        if (!http.begin(secureClient, currentUrl)) {
+            return false;
+        }
+        int status = -1;
+        if (usePost) {
+            http.addHeader("Content-Type", "application/json");
+            status = http.POST(body);
+        } else {
+            status = http.GET();
+        }
+        responseReceived = status > 0;
+
+        if (status == HTTP_CODE_MOVED_PERMANENTLY || status == HTTP_CODE_FOUND ||
+            status == HTTP_CODE_SEE_OTHER) {
+            String redirectUrl = http.getLocation();
+            if (redirectUrl.isEmpty()) redirectUrl = http.header("Location");
+            http.end();
+            if (!isAllowedAppsScriptRedirect(redirectUrl)) {
+                Serial.printf("Rejected Apps Script redirect target: %s\n",
+                              redirectUrl.c_str());
+                return false;
+            }
+            currentUrl = redirectUrl;
+            usePost = false;
+            continue;
+        }
+
+        if (status < 200 || status >= 300) {
+            Serial.printf("Apps Script HTTP error: %d\n", status);
+            http.end();
+            return false;
+        }
+
+        const int contentLength = http.getSize();
+        if (contentLength > 0 &&
+            static_cast<size_t>(contentLength) > kMaxHttpResponseBytes) {
+            Serial.printf("Apps Script response too large: %d bytes\n",
+                          contentLength);
+            http.end();
+            return false;
+        }
+        if (contentLength > 0) {
+            responseBody.reserve(static_cast<size_t>(contentLength) + 1);
+        }
+        BoundedStringStream sink(responseBody, kMaxHttpResponseBytes);
+        const int written = http.writeToStream(&sink);
         http.end();
-        return false;
+        if (written < 0 || sink.overflowed()) {
+            Serial.println("Apps Script response read failed or exceeded limit");
+            responseBody = "";
+            return false;
+        }
+        JsonDocument parsed;
+        if (deserializeJson(parsed, responseBody) != DeserializationError::Ok ||
+            !(parsed["ok"] | false)) {
+            Serial.println("Apps Script returned an invalid or unsuccessful response");
+            return false;
+        }
+        return true;
     }
-    responseBody = http.getString();
-    http.end();
-    JsonDocument parsed;
-    if (deserializeJson(parsed, responseBody) != DeserializationError::Ok ||
-        !(parsed["ok"] | false)) {
-        Serial.println("Apps Script returned an invalid or unsuccessful response");
-        return false;
-    }
-    return true;
+    Serial.println("Apps Script exceeded maximum redirect hops");
+    return false;
 }
 
 void networkTask(void*) {
@@ -801,14 +936,15 @@ void networkTask(void*) {
         }
         String responseBody;
         bool responseReceived = false;
-        const bool success =
-            performAppsScriptPost(job->body, responseBody, responseReceived);
+        const bool success = performAppsScriptPost(
+            job->url, job->body, responseBody, responseReceived);
         if (job->responseExpected) {
             NetworkResult* result = new (std::nothrow) NetworkResult{
                 job->requestId, success, responseReceived, responseBody
             };
             if (result == nullptr || networkAsyncResultQueue == nullptr ||
-                xQueueSend(networkAsyncResultQueue, &result, portMAX_DELAY) != pdTRUE) {
+                xQueueSend(networkAsyncResultQueue, &result,
+                           pdMS_TO_TICKS(5000)) != pdTRUE) {
                 delete result;
                 Serial.printf("Could not return network result for request %lu\n",
                               static_cast<unsigned long>(job->requestId));
@@ -820,14 +956,15 @@ void networkTask(void*) {
     }
 }
 
-bool enqueueNetworkRequest(const String& body, bool responseExpected,
-                           uint32_t requestId) {
+bool enqueueNetworkRequest(const String& url, const String& body,
+                           bool responseExpected, uint32_t requestId) {
     QueueHandle_t queue = responseExpected ? networkJobQueue : networkLogQueue;
-    if (queue == nullptr) {
+    if (queue == nullptr || url.isEmpty()) {
         Serial.println("Network request queue is unavailable");
         return false;
     }
-    NetworkJob* job = new (std::nothrow) NetworkJob{requestId, body, responseExpected};
+    NetworkJob* job = new (std::nothrow)
+        NetworkJob{requestId, url, body, responseExpected};
     if (job == nullptr) {
         Serial.println("Could not allocate an Apps Script request");
         return false;
@@ -854,7 +991,8 @@ bool enqueueAppsScriptLog(JsonDocument& request) {
     request["token"] = config.apiToken;
     String body;
     serializeJson(request, body);
-    return enqueueNetworkRequest(body, false, nextNetworkRequestId());
+    return enqueueNetworkRequest(config.appsScriptUrl, body, false,
+                                 nextNetworkRequestId());
 }
 
 bool enqueueAsyncAppsScriptRequest(JsonDocument& request, uint32_t requestId,
@@ -865,7 +1003,8 @@ bool enqueueAsyncAppsScriptRequest(JsonDocument& request, uint32_t requestId,
     }
     request["token"] = config.apiToken;
     serializeJson(request, serializedRequest);
-    return enqueueNetworkRequest(serializedRequest, true, requestId);
+    return enqueueNetworkRequest(config.appsScriptUrl, serializedRequest, true,
+                                 requestId);
 }
 
 bool initializeNetworkWorker() {
@@ -899,7 +1038,9 @@ bool initializeNetworkWorker() {
 }
 
 void addLog(const char* level, const char* code, const String& message) {
-    const String eventId = String(millis()) + "-" + String(++eventCounter);
+    const String eventId = String(esp_random(), HEX) + "-" +
+                           String(esp_random(), HEX) + "-" +
+                           String(++eventCounter);
     const String timestamp = currentTimestamp();
     bool localLogWritten = false;
     if (!sdAvailable) {
@@ -943,64 +1084,113 @@ void addLog(const char* level, const char* code, const String& message) {
     }
 }
 
-bool loadConfig() {
-    if (!sdAvailable) return false;
-    File file = SD.open(kConfigPath, FILE_READ);
+bool loadConfigFile(const char* path) {
+    File file = SD.open(path, FILE_READ);
     if (!file) return false;
 
     JsonDocument document;
     const DeserializationError error = deserializeJson(document, file);
     file.close();
     if (error) {
-        Serial.printf("Invalid config.json: %s\n", error.c_str());
+        Serial.printf("Invalid %s: %s\n", path, error.c_str());
         return false;
     }
 
     if ((document["schema_version"] | 0) != 1) {
-        Serial.println("Unsupported config.json schema_version");
+        Serial.printf("Unsupported schema_version in %s\n", path);
         return false;
     }
+    Config loadedConfig;
     const char* mode = document["mode"] | "";
     const char* language = document["language"] | "";
     if (strcmp(mode, "offline") == 0) {
-        config.mode = Mode::Offline;
+        loadedConfig.mode = Mode::Offline;
     } else if (strcmp(mode, "online") == 0) {
-        config.mode = Mode::Online;
+        loadedConfig.mode = Mode::Online;
     } else {
-        Serial.println("config.json must explicitly select offline or online mode");
+        Serial.printf("%s must explicitly select offline or online mode\n", path);
         return false;
     }
-    config.ssid = document["wifi_ssid"] | "";
-    config.wifiPassword = document["wifi_password"] | "";
-    config.appsScriptUrl = document["apps_script_url"] | "";
-    config.apiToken = document["api_token"] | "";
-    config.employeesSheetUrl = document["employees_sheet_url"] | "";
-    config.attendanceSheetUrl = document["attendance_sheet_url"] | "";
-    config.logsSheetUrl = document["logs_sheet_url"] | "";
-    config.timezoneOffsetMinutes = document["timezone_offset_minutes"] | 60;
-    config.cameraEnabled = document["camera_enabled"] | false;
+    loadedConfig.ssid = document["wifi_ssid"] | "";
+    loadedConfig.wifiPassword = document["wifi_password"] | "";
+    loadedConfig.appsScriptUrl = document["apps_script_url"] | "";
+    loadedConfig.apiToken = document["api_token"] | "";
+    loadedConfig.employeesSheetUrl = document["employees_sheet_url"] | "";
+    loadedConfig.attendanceSheetUrl = document["attendance_sheet_url"] | "";
+    loadedConfig.logsSheetUrl = document["logs_sheet_url"] | "";
+    loadedConfig.timezoneOffsetMinutes = document["timezone_offset_minutes"] | 60;
+    if (loadedConfig.timezoneOffsetMinutes < -720 ||
+        loadedConfig.timezoneOffsetMinutes > 840) {
+        Serial.printf("%s has an out-of-range timezone_offset_minutes\n", path);
+        return false;
+    }
+    loadedConfig.cameraEnabled = document["camera_enabled"] | false;
 
-    if (strcmp(language, "pl") == 0) config.language = Language::Polish;
-    else if (strcmp(language, "en") == 0) config.language = Language::English;
-    else if (strcmp(language, "es") == 0) config.language = Language::Spanish;
-    else if (strcmp(language, "de") == 0) config.language = Language::German;
+    if (strcmp(language, "pl") == 0) loadedConfig.language = Language::Polish;
+    else if (strcmp(language, "en") == 0) loadedConfig.language = Language::English;
+    else if (strcmp(language, "es") == 0) loadedConfig.language = Language::Spanish;
+    else if (strcmp(language, "de") == 0) loadedConfig.language = Language::German;
     else {
-        Serial.println("config.json has an unsupported language");
+        Serial.printf("%s has an unsupported language\n", path);
         return false;
     }
-    if (config.mode == Mode::Online) {
-        if (config.ssid.isEmpty() ||
-            !config.appsScriptUrl.startsWith("https://script.google.com/macros/s/") ||
-            !config.appsScriptUrl.endsWith("/exec") || config.apiToken.length() < 32 ||
-            !config.employeesSheetUrl.startsWith("https://docs.google.com/spreadsheets/d/") ||
-            !config.attendanceSheetUrl.startsWith("https://docs.google.com/spreadsheets/d/") ||
-            !config.logsSheetUrl.startsWith("https://docs.google.com/spreadsheets/d/")) {
-            Serial.println("Online config is incomplete; refusing offline fallback");
+    if (loadedConfig.mode == Mode::Online) {
+        if (loadedConfig.ssid.isEmpty() ||
+            !loadedConfig.appsScriptUrl.startsWith("https://script.google.com/macros/s/") ||
+            !loadedConfig.appsScriptUrl.endsWith("/exec") ||
+            loadedConfig.apiToken.length() < 32 ||
+            !loadedConfig.employeesSheetUrl.startsWith("https://docs.google.com/spreadsheets/d/") ||
+            !loadedConfig.attendanceSheetUrl.startsWith("https://docs.google.com/spreadsheets/d/") ||
+            !loadedConfig.logsSheetUrl.startsWith("https://docs.google.com/spreadsheets/d/")) {
+            Serial.printf("Online configuration in %s is incomplete\n", path);
             return false;
         }
     }
-    configurationValid = true;
+    config = loadedConfig;
     return true;
+}
+
+bool loadConfig() {
+    if (!sdAvailable) return false;
+    if (SD.exists(kConfigPath) && loadConfigFile(kConfigPath)) {
+        configLoadedFromBackup = false;
+        configurationValid = true;
+        return true;
+    }
+    if (SD.exists(kConfigBackupPath) && loadConfigFile(kConfigBackupPath)) {
+        configLoadedFromBackup = true;
+        configurationValid = true;
+        Serial.println("Recovered configuration from /config.json.bak");
+        return true;
+    }
+    Serial.println("No valid config.json or config.json.bak found");
+    return false;
+}
+
+bool configsEqual(const Config& left, const Config& right) {
+    return left.mode == right.mode &&
+           left.language == right.language &&
+           left.ssid == right.ssid &&
+           left.wifiPassword == right.wifiPassword &&
+           left.appsScriptUrl == right.appsScriptUrl &&
+           left.apiToken == right.apiToken &&
+           left.employeesSheetUrl == right.employeesSheetUrl &&
+           left.attendanceSheetUrl == right.attendanceSheetUrl &&
+           left.logsSheetUrl == right.logsSheetUrl &&
+           left.timezoneOffsetMinutes == right.timezoneOffsetMinutes &&
+           left.cameraEnabled == right.cameraEnabled;
+}
+
+bool writeConfigDocument(const char* path, JsonDocument& document) {
+    SD.remove(path);
+    File file = SD.open(path, FILE_WRITE);
+    if (!file) return false;
+    const size_t expected = measureJson(document);
+    const size_t written = serializeJson(document, file);
+    file.flush();
+    const bool ok = expected > 0 && written == expected && file.getWriteError() == 0;
+    file.close();
+    return ok;
 }
 
 bool saveConfig() {
@@ -1039,28 +1229,49 @@ bool saveConfig() {
     document["camera_enabled"] = config.cameraEnabled;
 
     constexpr char temporaryPath[] = "/config.json.tmp";
-    constexpr char backupPath[] = "/config.json.bak";
-    File file = SD.open(temporaryPath, FILE_WRITE);
-    if (!file) return false;
-    const size_t written = serializeJson(document, file);
-    file.flush();
-    file.close();
-    if (written == 0) {
+    constexpr char backupTemporaryPath[] = "/config.json.bak.tmp";
+    constexpr char invalidPath[] = "/config.json.invalid";
+    if (!writeConfigDocument(temporaryPath, document)) {
         SD.remove(temporaryPath);
         return false;
     }
-    SD.remove(backupPath);
-    const bool hadOriginal = SD.exists(kConfigPath);
-    if (hadOriginal && !SD.rename(kConfigPath, backupPath)) {
-        SD.remove(temporaryPath);
-        return false;
+
+    if (configLoadedFromBackup) {
+        SD.remove(invalidPath);
+        const bool hadOriginal = SD.exists(kConfigPath);
+        if (hadOriginal && !SD.rename(kConfigPath, invalidPath)) {
+            SD.remove(temporaryPath);
+            return false;
+        }
+        if (!SD.rename(temporaryPath, kConfigPath)) {
+            if (hadOriginal) SD.rename(invalidPath, kConfigPath);
+            SD.remove(temporaryPath);
+            return false;
+        }
+        SD.remove(invalidPath);
+        configLoadedFromBackup = false;
+    } else {
+        const bool hadOriginal = SD.exists(kConfigPath);
+        if (hadOriginal) {
+            SD.remove(kConfigBackupPath);
+            if (!SD.rename(kConfigPath, kConfigBackupPath)) {
+                SD.remove(temporaryPath);
+                return false;
+            }
+        }
+        if (!SD.rename(temporaryPath, kConfigPath)) {
+            if (hadOriginal) SD.rename(kConfigBackupPath, kConfigPath);
+            SD.remove(temporaryPath);
+            return false;
+        }
+        if (!SD.exists(kConfigBackupPath)) {
+            if (!writeConfigDocument(backupTemporaryPath, document) ||
+                !SD.rename(backupTemporaryPath, kConfigBackupPath)) {
+                SD.remove(backupTemporaryPath);
+                Serial.println("Could not create emergency config.json.bak");
+            }
+        }
     }
-    if (!SD.rename(temporaryPath, kConfigPath)) {
-        if (hadOriginal) SD.rename(backupPath, kConfigPath);
-        SD.remove(temporaryPath);
-        return false;
-    }
-    SD.remove(backupPath);
     configurationValid = true;
     return true;
 }
@@ -1068,6 +1279,7 @@ bool saveConfig() {
 bool loadEmployeesFromCsv() {
     employees.clear();
     offlineEmployeesLoaded = false;
+    offlineEmployeesTruncated = false;
     if (!sdAvailable) return false;
     File file = SD.open(kEmployeesPath, FILE_READ);
     if (!file) return false;
@@ -1113,7 +1325,10 @@ bool loadEmployeesFromCsv() {
         employee.relayAccess = relayAccess == "true" || relayAccess == "1";
         bool duplicate = employee.id.isEmpty() || employee.uid.isEmpty();
         for (const auto& existing : employees) {
-            if (existing.id == employee.id || existing.uid == employee.uid) duplicate = true;
+            if (existing.id.equalsIgnoreCase(employee.id) ||
+                existing.uid == employee.uid) {
+                duplicate = true;
+            }
         }
         if (duplicate) {
             file.close();
@@ -1123,9 +1338,18 @@ bool loadEmployeesFromCsv() {
         }
         employees.push_back(employee);
     }
+    while (readCsvRecord(file, line)) {
+        if (!line.isEmpty()) {
+            offlineEmployeesTruncated = true;
+            Serial.printf("Warning: employees.csv exceeds maximum capacity (%u)\n",
+                          static_cast<unsigned>(kMaximumEmployees));
+            break;
+        }
+    }
     file.close();
     if (!loadOfflineAttendanceIndex()) {
         employees.clear();
+        offlineEmployeesTruncated = false;
         Serial.println("Could not build the offline attendance index");
         return false;
     }
@@ -1192,6 +1416,10 @@ void updateOfflineAttendance(const String& employeeId, const String& eventType) 
 }
 
 bool persistEmployeesOffline(const std::vector<Employee>& rows) {
+    if (offlineEmployeesTruncated) {
+        Serial.println("Refusing to overwrite truncated employees.csv");
+        return false;
+    }
     constexpr char temporaryPath[] = "/employees.csv.tmp";
     constexpr char backupPath[] = "/employees.csv.bak";
     SD.remove(temporaryPath);
@@ -1211,6 +1439,7 @@ bool persistEmployeesOffline(const std::vector<Employee>& rows) {
         writeOk = file.print(csvRow) == csvRow.length();
     }
     file.flush();
+    writeOk = writeOk && file.getWriteError() == 0;
     file.close();
     if (!writeOk) {
         SD.remove(temporaryPath);
@@ -1346,7 +1575,10 @@ bool parseOnlineEmployees(JsonArrayConst rows, std::vector<Employee>& parsedEmpl
         employee.relayAccess = relayAccess == "true" || relayAccess == "1";
         bool duplicate = employee.id.isEmpty() || employee.uid.isEmpty();
         for (const auto& existing : parsedEmployees) {
-            if (existing.id == employee.id || existing.uid == employee.uid) duplicate = true;
+            if (existing.id.equalsIgnoreCase(employee.id) ||
+                existing.uid == employee.uid) {
+                duplicate = true;
+            }
         }
         if (duplicate) {
             parsedEmployees.clear();
@@ -1463,16 +1695,33 @@ bool appendAttendance(const Employee& employee, AttendanceAction action,
     return true;
 }
 
-bool hasPendingOnlineAttendance() {
-    if (!sdAvailable || !SD.exists(kPendingAttendancePath)) return false;
+bool refreshPendingOnlineAttendanceFlag() {
+    if (!sdAvailable || !SD.exists(kPendingAttendancePath)) {
+        pendingQueueChecked = true;
+        pendingQueueHasRows = false;
+        return false;
+    }
     File file = SD.open(kPendingAttendancePath, FILE_READ);
-    if (!file) return true;
+    if (!file) {
+        pendingQueueChecked = true;
+        pendingQueueHasRows = true;
+        return true;
+    }
     String record;
     const bool headerOk = readCsvRecord(file, record) &&
                           record == kAttendanceHeader;
     const bool hasRows = headerOk && readCsvRecord(file, record);
     file.close();
-    return !headerOk || hasRows;
+    pendingQueueChecked = true;
+    pendingQueueHasRows = !headerOk || hasRows;
+    return pendingQueueHasRows;
+}
+
+bool hasPendingOnlineAttendance() {
+    if (!pendingQueueChecked) {
+        return refreshPendingOnlineAttendanceFlag();
+    }
+    return pendingQueueHasRows;
 }
 
 bool appendPendingOnlineAttendance(const Employee& employee,
@@ -1508,6 +1757,8 @@ bool appendPendingOnlineAttendance(const Employee& employee,
         Serial.println("Could not fully write online attendance queue record");
         return false;
     }
+    pendingQueueChecked = true;
+    pendingQueueHasRows = true;
     return true;
 }
 
@@ -1570,6 +1821,7 @@ bool removePendingOnlineAttendance(const String& eventId) {
         return false;
     }
     SD.remove(backupPath);
+    refreshPendingOnlineAttendanceFlag();
     return true;
 }
 
@@ -1663,10 +1915,15 @@ void schedulePendingAttendanceStatusCheck() {
 bool startPendingOnlineAttendanceUpload() {
     if (pendingQueueUploadRequestId != 0 || config.mode != Mode::Online ||
         WiFi.status() != WL_CONNECTED || !sdAvailable ||
+        !hasPendingOnlineAttendance() ||
         static_cast<int32_t>(millis() - nextQueueUploadAttemptAt) < 0) {
         return false;
     }
-    if (!SD.exists(kPendingAttendancePath)) return false;
+    if (!SD.exists(kPendingAttendancePath)) {
+        pendingQueueChecked = true;
+        pendingQueueHasRows = false;
+        return false;
+    }
     File file = SD.open(kPendingAttendancePath, FILE_READ);
     if (!file) {
         Serial.println("Could not open online attendance queue for upload");
@@ -1694,6 +1951,8 @@ bool startPendingOnlineAttendanceUpload() {
     }
     if (!readCsvRecord(file, record)) {
         file.close();
+        pendingQueueChecked = true;
+        pendingQueueHasRows = false;
         return false;
     }
     file.close();
@@ -1831,6 +2090,7 @@ void handleAsyncNetworkResults() {
             }
             if (validResponse) {
                 selectedEmployeePresent = eventType == "ENTRY";
+                screenSince = millis();
                 screen = Screen::ActionChoice;
                 drawActionChoice();
             } else {
@@ -1838,6 +2098,7 @@ void handleAsyncNetworkResults() {
                 addLog("WARN", "ATTENDANCE_STATE_CHECK_FAILED",
                        "Falling back to employee-confirmed entry or exit");
                 outageActionChoice = true;
+                screenSince = millis();
                 screen = Screen::ActionChoice;
                 drawActionChoice();
             }
@@ -1894,7 +2155,6 @@ void handleAsyncNetworkResults() {
                     }
                 }
                 pendingEmployeeRegistration = Employee{};
-                if (screen == Screen::EmployeeEnroll) drawEmployeeEnrollment();
                 if (screen == Screen::EmployeeEnroll) drawEmployeeEnrollment();
             }
         } else if (pendingAttendanceRequestId != 0 &&
@@ -1957,6 +2217,7 @@ void handleAsyncNetworkResults() {
                             enqueueAsyncAppsScriptRequest(retryRequest, retryId,
                                                           serializedRequest)) {
                             pendingAttendanceRequestId = retryId;
+                            pendingAttendanceRequestStartedAt = millis();
                         } else {
                             nextPendingStatusAttemptAt = millis() + 10000;
                         }
@@ -2036,6 +2297,7 @@ void processAttendance(AttendanceAction action, bool automatic = false) {
     if (config.mode == Mode::Online && automatic &&
         WiFi.status() != WL_CONNECTED) {
         outageActionChoice = true;
+        screenSince = millis();
         screen = Screen::ActionChoice;
         drawActionChoice();
         return;
@@ -2093,6 +2355,7 @@ void processAttendance(AttendanceAction action, bool automatic = false) {
         if (WiFi.status() != WL_CONNECTED) {
             if (automatic) {
                 outageActionChoice = true;
+                screenSince = millis();
                 screen = Screen::ActionChoice;
                 drawActionChoice();
                 return;
@@ -2169,6 +2432,65 @@ void processAttendance(AttendanceAction action, bool automatic = false) {
     drawAttendanceConfirmation();
 }
 
+const char* transliterateUtf8ToAscii(const String& value, size_t index,
+                                     size_t& consumed) {
+    consumed = 1;
+    if (index + 1 >= value.length()) return nullptr;
+    const uint8_t b0 = static_cast<uint8_t>(value[index]);
+    const uint8_t b1 = static_cast<uint8_t>(value[index + 1]);
+    if (b0 == 0xC3) {
+        consumed = 2;
+        switch (b1) {
+            case 0x81: case 0x84: return "A";
+            case 0x89: return "E";
+            case 0x8D: return "I";
+            case 0x91: return "N";
+            case 0x93: case 0x96: return "O";
+            case 0x9A: case 0x9C: return "U";
+            case 0x9F: return "ss";
+            case 0xA1: case 0xA4: return "a";
+            case 0xA9: return "e";
+            case 0xAD: return "i";
+            case 0xB1: return "n";
+            case 0xB3: case 0xB6: return "o";
+            case 0xBA: case 0xBC: return "u";
+            default: return nullptr;
+        }
+    }
+    if (b0 == 0xC4) {
+        consumed = 2;
+        switch (b1) {
+            case 0x84: return "A";
+            case 0x85: return "a";
+            case 0x86: return "C";
+            case 0x87: return "c";
+            case 0x98: return "E";
+            case 0x99: return "e";
+            default: return nullptr;
+        }
+    }
+    if (b0 == 0xC5) {
+        consumed = 2;
+        switch (b1) {
+            case 0x81: return "L";
+            case 0x82: return "l";
+            case 0x83: return "N";
+            case 0x84: return "n";
+            case 0x9A: return "S";
+            case 0x9B: return "s";
+            case 0xB9: case 0xBB: return "Z";
+            case 0xBA: case 0xBC: return "z";
+            default: return nullptr;
+        }
+    }
+    if (b0 == 0xE1 && index + 2 < value.length() &&
+        b1 == 0xBA && static_cast<uint8_t>(value[index + 2]) == 0x9E) {
+        consumed = 3;
+        return "SS";
+    }
+    return nullptr;
+}
+
 String photoNameComponent(const String& value) {
     String result;
     result.reserve(min<size_t>(value.length(), 32));
@@ -2176,30 +2498,26 @@ String photoNameComponent(const String& value) {
     for (size_t index = 0; index < value.length() && result.length() < 32;) {
         const uint8_t character = static_cast<uint8_t>(value[index]);
         if (character >= 0x80) {
-            size_t sequenceLength = (character & 0xE0) == 0xC0 ? 2
-                                    : (character & 0xF0) == 0xE0 ? 3
-                                    : (character & 0xF8) == 0xF0 ? 4
-                                                                  : 0;
-            if (sequenceLength == 0 || index + sequenceLength > value.length() ||
-                result.length() + sequenceLength > 32) {
-                break;
-            }
-            bool validSequence = true;
-            for (size_t offset = 1; offset < sequenceLength; ++offset) {
-                if ((static_cast<uint8_t>(value[index + offset]) & 0xC0) != 0x80) {
-                    validSequence = false;
-                    break;
+            size_t consumed = 1;
+            const char* ascii = transliterateUtf8ToAscii(value, index, consumed);
+            if (ascii != nullptr) {
+                const size_t asciiLen = strlen(ascii);
+                if (result.length() + asciiLen <= 32) {
+                    result += ascii;
+                    previousUnderscore = false;
                 }
+                index += consumed;
+            } else {
+                const size_t seqLen = (character & 0xE0) == 0xC0 ? 2
+                                      : (character & 0xF0) == 0xE0 ? 3
+                                      : (character & 0xF8) == 0xF0 ? 4
+                                                                    : 1;
+                if (!previousUnderscore && !result.isEmpty()) {
+                    result += '_';
+                    previousUnderscore = true;
+                }
+                index += min(seqLen, value.length() - index);
             }
-            if (!validSequence) {
-                ++index;
-                continue;
-            }
-            for (size_t offset = 0; offset < sequenceLength; ++offset) {
-                result += value[index + offset];
-            }
-            index += sequenceLength;
-            previousUnderscore = false;
             continue;
         }
         const bool allowed =
@@ -2232,6 +2550,10 @@ String capturePhoto(const Employee& employee, const String& eventId) {
         addLog("ERROR", "PHOTO_TIMESTAMP_UNAVAILABLE",
                "Nie można nadać zdjęciu daty i godziny bez RTC");
         return "";
+    }
+    camera_fb_t* staleFrame = esp_camera_fb_get();
+    if (staleFrame != nullptr) {
+        esp_camera_fb_return(staleFrame);
     }
     camera_fb_t* frame = esp_camera_fb_get();
     if (frame == nullptr) {
@@ -2305,9 +2627,9 @@ bool initCamera() {
     cameraConfig.pixel_format = PIXFORMAT_JPEG;
     cameraConfig.frame_size = FRAMESIZE_VGA;
     cameraConfig.jpeg_quality = 12;
-    cameraConfig.fb_count = 1;
+    cameraConfig.fb_count = 2;
     cameraConfig.fb_location = CAMERA_FB_IN_PSRAM;
-    cameraConfig.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+    cameraConfig.grab_mode = CAMERA_GRAB_LATEST;
     const esp_err_t result = esp_camera_init(&cameraConfig);
     if (result != ESP_OK) {
         cameraInitError = result;
@@ -2323,23 +2645,30 @@ void relayTimerCallback(void*) {
     relayAutoClosed = true;
 }
 
-void setRelay(bool enabled) {
+void setRelay(bool enabled, const String& actorInfo = "") {
     if (enabled) {
+        if (relayTimer != nullptr && esp_timer_is_active(relayTimer)) {
+            esp_timer_stop(relayTimer);
+        }
+        relayAutoClosed = false;
         digitalWrite(pins::relay, LOW);
         relayWasActive = true;
-        relayOffAt = millis() + kRelayPulseMs;
+        uint32_t fallbackOffAt = millis() + kRelayPulseMs;
+        if (fallbackOffAt == 0) fallbackOffAt = 1;
+        relayOffAt = fallbackOffAt;
         if (relayTimer != nullptr) {
-            if (esp_timer_is_active(relayTimer)) esp_timer_stop(relayTimer);
             if (esp_timer_start_once(relayTimer, kRelayPulseMs * 1000) == ESP_OK) {
                 relayOffAt = 0;
             }
         }
+        addLog("INFO", "RELAY_UNLOCKED", actorInfo);
         return;
     }
-    digitalWrite(pins::relay, HIGH);
     if (relayTimer != nullptr && esp_timer_is_active(relayTimer)) {
         esp_timer_stop(relayTimer);
     }
+    relayAutoClosed = false;
+    digitalWrite(pins::relay, HIGH);
     relayOffAt = 0;
     if (relayWasActive) {
         relayWasActive = false;
@@ -2413,6 +2742,7 @@ void drawHomeQuoteArea() {
             quoteSize += 0.1f;
         }
         const int16_t lineHeight = 60 / lineCount;
+        display.setTextColor(color(248, 250, 255), panelColor);
         for (uint8_t line = 0; line < lineCount; ++line) {
             drawFittedText(lines[line], 32, 188 + line * lineHeight, 416,
                            lineHeight, readableUiSize(quoteSize),
@@ -2741,12 +3071,9 @@ void drawActionChoice() {
         drawButton(250, 154, 205, 72,
                    text("WYJŚCIE", "CLOCK OUT", "SALIDA", "GEHEN"),
                    color(45, 101, 191));
-        if (selectedEmployee.relayAccess) {
-            drawButton(115, 236, 250, 54,
-                       text("Otwórz drzwi", "Unlock door",
-                            "Abrir puerta", "Tür öffnen"),
-                       color(164, 94, 34));
-        }
+        drawButton(165, 252, 150, 46,
+                   text("Anuluj", "Cancel", "Cancelar", "Abbrechen"),
+                   color(103, 47, 58));
         return;
     }
     display.setTextColor(color(246, 249, 255));
@@ -2777,6 +3104,9 @@ void drawActionChoice() {
                    text("Wejście", "Clock in", "Entrada", "Kommen"),
                    color(25, 139, 103));
     }
+    drawButton(165, 252, 150, 46,
+               text("Anuluj", "Cancel", "Cancelar", "Abbrechen"),
+               color(103, 47, 58));
 }
 
 void drawPinEntry() {
@@ -2795,7 +3125,13 @@ void drawPinEntry() {
                                          "Introduzca un nuevo PIN", "Neue PIN eingeben")
                                   : text("PIN ustawień", "Settings PIN", "PIN de ajustes",
                                          "Einstellungs-PIN");
-    display.drawCenterString(title, 240, 18);
+    display.drawCenterString(title, 240, 14);
+    if (!lastMessage.isEmpty()) {
+        display.setTextColor(color(255, 191, 87));
+        drawFittedText(lastMessage, 24, 38, 432, 20, readableUiSize(1.4f),
+                       lgfx::textdatum_t::middle_center);
+        display.setTextColor(color(246, 249, 255));
+    }
     setUiTextSize(2);
     String masked;
     for (size_t i = 0; i < pinInput.length(); ++i) masked += "* ";
@@ -3284,8 +3620,7 @@ void drawEmployeeList() {
                    text("Usuń", "Remove", "Borrar", "Löschen"),
                    color(103, 47, 58));
     }
-    drawVerticalScrollbar(450, 48, 196, count, kRowsPerPage,
-                          employeeListPage * kRowsPerPage);
+    drawVerticalScrollbar(450, 48, 196, pageCount, 1, employeeListPage);
     if (!lastMessage.isEmpty()) {
         display.setTextColor(color(255, 205, 112));
         drawFittedText(lastMessage, 20, 248, 420, 17,
@@ -3443,7 +3778,9 @@ bool captureCalibrationPoint(float& rawX, float& rawY) {
     uint32_t sumX = 0;
     uint32_t sumY = 0;
     uint8_t samples = 0;
-    while (samples < 12) {
+    constexpr uint32_t kHoldTimeoutMs = 5000;
+    const uint32_t holdStarted = millis();
+    while (samples < 12 && millis() - holdStarted < kHoldTimeoutMs) {
         if (display.getTouchRaw(&raw)) {
             sumX += static_cast<uint16_t>(raw.x);
             sumY += static_cast<uint16_t>(raw.y);
@@ -3453,7 +3790,10 @@ bool captureCalibrationPoint(float& rawX, float& rawY) {
         }
         delay(12);
     }
-    while (display.getTouchRaw(&raw)) delay(20);
+    const uint32_t releaseStarted = millis();
+    while (display.getTouchRaw(&raw) && millis() - releaseStarted < kHoldTimeoutMs) {
+        delay(20);
+    }
     if (samples < 4) return false;
     rawX = static_cast<float>(sumX) / samples;
     rawY = static_cast<float>(sumY) / samples;
@@ -3587,6 +3927,13 @@ Employee* findEmployee(const String& uid) {
     return nullptr;
 }
 
+Employee* findEmployeeAny(const String& uid) {
+    for (auto& employee : employees) {
+        if (employee.uid == uid) return &employee;
+    }
+    return nullptr;
+}
+
 void finishEmployeeRegistration(const Employee& employee) {
     for (size_t index = employees.size(); index > 0; --index) {
         const Employee& existing = employees[index - 1];
@@ -3666,7 +4013,8 @@ bool saveNewEmployee() {
             }
         }
     }
-    if (config.mode == Mode::Offline && employees.size() >= kMaximumEmployees) {
+    if (config.mode == Mode::Offline &&
+        (employees.size() >= kMaximumEmployees || offlineEmployeesTruncated)) {
         lastMessage = text("Osiągnięto limit pracowników",
                            "Employee limit reached",
                            "Límite de empleados alcanzado",
@@ -3753,6 +4101,7 @@ bool saveNewEmployee() {
         }
         writeEmployee(employee);
         file.flush();
+        writeOk = writeOk && file.getWriteError() == 0;
         file.close();
         if (!writeOk) {
             SD.remove(temporaryPath);
@@ -3795,17 +4144,21 @@ void handleCard() {
         (!onlineEmployeesLoaded || !pendingOnlineEventId.isEmpty())) return;
     if (config.mode == Mode::Online && WiFi.status() == WL_CONNECTED &&
         hasPendingOnlineAttendance()) {
-        lastMessage = text("Wysyłanie tymczasowych odbić — poczekaj",
-                           "Syncing temporary punches — please wait",
-                           "Enviando registros — espere",
-                           "Temporäre Buchungen werden gesendet — bitte warten");
-        if (pendingQueueSyncFailed) {
-            lastMessage = text("Odbicia oczekują na wysłanie — sprawdź połączenie",
-                               "Punches are pending — check the connection",
-                               "Registros pendientes — revise la conexión",
-                               "Buchungen warten — Verbindung prüfen");
+        const String banner =
+            pendingQueueSyncFailed
+                ? text("Odbicia oczekują na wysłanie — sprawdź połączenie",
+                       "Punches are pending — check the connection",
+                       "Registros pendientes — revise la conexión",
+                       "Buchungen warten — Verbindung prüfen")
+                : text("Wysyłanie tymczasowych odbić — poczekaj",
+                       "Syncing temporary punches — please wait",
+                       "Enviando registros — espere",
+                       "Temporäre Buchungen werden gesendet — bitte warten");
+        if (!pendingQueueBlockBannerShown || lastMessage != banner) {
+            lastMessage = banner;
+            pendingQueueBlockBannerShown = true;
+            if (screen == Screen::Home) drawHome();
         }
-        if (screen == Screen::Home) drawHome();
         return;
     }
     if (!rfidAvailable || !rfid.PICC_IsNewCardPresent() ||
@@ -3831,6 +4184,7 @@ void handleCard() {
                            "Configuration or employee list unavailable",
                            "Configuración o empleados no disponibles",
                            "Konfiguration oder Mitarbeiterliste fehlt");
+        screen = Screen::Home;
         drawHome();
         return;
     }
@@ -3852,7 +4206,7 @@ void handleCard() {
                 return;
             }
         }
-        Employee* employee = config.mode == Mode::Online ? nullptr : findEmployee(uid);
+        Employee* employee = findEmployeeAny(uid);
         if (employee != nullptr) {
             lastMessage = text("Ta karta jest już przypisana do pracownika",
                                "This card is already assigned to an employee",
@@ -3868,6 +4222,14 @@ void handleCard() {
         screenSince = millis();
         screen = Screen::PinEntry;
         drawPinEntry();
+        return;
+    }
+    Employee* existingAny = findEmployeeAny(uid);
+    if (existingAny != nullptr && !existingAny->active) {
+        lastMessage = text("Karta nieaktywna", "Card inactive",
+                           "Tarjeta inactiva", "Karte inaktiv");
+        addLog("WARN", "INACTIVE_CARD_REJECTED", existingAny->id + ":" + uid);
+        drawHome();
         return;
     }
     Employee* employee = findEmployee(uid);
@@ -3892,6 +4254,7 @@ void handleCard() {
     selectedEmployee = *employee;
     if (config.mode == Mode::Online && WiFi.status() != WL_CONNECTED) {
         outageActionChoice = true;
+        screenSince = millis();
         screen = Screen::ActionChoice;
         drawActionChoice();
         return;
@@ -3918,6 +4281,7 @@ void handleCard() {
         }
         selectedEmployeePresent =
             lastOfflineAttendance(employee->id) == "ENTRY";
+        screenSince = millis();
         screen = Screen::ActionChoice;
         drawActionChoice();
         return;
@@ -3941,13 +4305,25 @@ void handleCard() {
 }
 
 void handlePinTouch(int32_t x, int32_t y) {
+    screenSince = millis();
     if (y >= 270 && x >= 188 && x <= 292) {
         screen = employeeManagementReturnToList ? Screen::EmployeeList : Screen::Home;
         pinInput = "";
+        pendingPin = "";
+        lastMessage = "";
         employeeEnrollmentRequested = false;
         pendingEmployeeUid = "";
         if (employeeManagementReturnToList) drawEmployeeList();
         else drawHome();
+        return;
+    }
+    if (screen == Screen::PinEntry && pinLockedUntilMs != 0 &&
+        static_cast<int32_t>(millis() - pinLockedUntilMs) < 0) {
+        lastMessage = text("Zbyt wiele błędnych prób — poczekaj",
+                           "Too many failed attempts — wait",
+                           "Demasiados intentos — espere",
+                           "Zu viele Fehlversuche — warten");
+        drawPinEntry();
         return;
     }
     if (y >= 84 && y < 264) {
@@ -3957,18 +4333,38 @@ void handlePinTouch(int32_t x, int32_t y) {
         const int key = row * 3 + column;
         if (key == 9) {
             pinInput = "";
+            lastMessage = "";
         } else if (key == 11) {
             if (pinInput.length() != 4) return;
             if (screen == Screen::PinChange) {
                 pendingPin = pinInput;
                 pinInput = "";
+                lastMessage = "";
                 screen = Screen::PinConfirm;
             } else if (screen == Screen::PinConfirm) {
                 if (pinInput == pendingPin) {
+                    if (preferences.putString("pin", pendingPin) == 0) {
+                        pinInput = "";
+                        pendingPin = "";
+                        screen = Screen::Settings;
+                        lastMessage = text("Nie zapisano nowego PIN-u",
+                                           "Could not save new PIN",
+                                           "No se pudo guardar el PIN",
+                                           "Neue PIN konnte nicht gespeichert werden");
+                        drawSettings();
+                        return;
+                    }
                     storedPin = pendingPin;
-                    preferences.putString("pin", storedPin);
+                    pinInput = "";
+                    pendingPin = "";
                     addLog("INFO", "PIN_CHANGED", "");
+                    lastMessage = text("PIN został zmieniony",
+                                       "PIN updated",
+                                       "PIN actualizado",
+                                       "PIN geändert");
                     screen = Screen::Settings;
+                    drawSettings();
+                    return;
                 } else {
                     pinInput = "";
                     pendingPin = "";
@@ -3979,6 +4375,10 @@ void handlePinTouch(int32_t x, int32_t y) {
                                        "PINs stimmen nicht überein");
                 }
             } else if (pinInput == storedPin) {
+                pinFailedAttempts = 0;
+                pinLockedUntilMs = 0;
+                pinInput = "";
+                lastMessage = "";
                 if (employeeEnrollmentRequested) {
                     employeeEnrollmentRequested = false;
                     newEmployeeId = "";
@@ -3989,25 +4389,38 @@ void handlePinTouch(int32_t x, int32_t y) {
                     enrollmentField = 0;
                     enrollmentAccentIndex = 0;
                     enrollmentLowercase = false;
-                    lastMessage = "";
                     screen = Screen::EmployeeEnroll;
                     screenSince = millis();
                     drawEmployeeEnrollment();
                 } else {
                     screen = Screen::Settings;
+                    screenSince = millis();
                     drawSettings();
                 }
-                pinInput = "";
+                return;
             } else {
                 pinInput = "";
-                lastMessage = text("Nieprawidłowy PIN", "Incorrect PIN",
-                                   "PIN incorrecto", "Falsche PIN");
-                addLog("WARN", "PIN_REJECTED", "");
+                ++pinFailedAttempts;
+                if (pinFailedAttempts >= kMaxPinFailuresBeforeLockout) {
+                    pinFailedAttempts = 0;
+                    pinLockedUntilMs = millis() + kPinLockoutMs;
+                    if (pinLockedUntilMs == 0) pinLockedUntilMs = 1;
+                    lastMessage = text("Zbyt wiele prób — blokada 30 s",
+                                       "Too many attempts — locked 30s",
+                                       "Demasiados intentos — bloqueo 30 s",
+                                       "Zu viele Versuche — 30 s gesperrt");
+                    addLog("WARN", "PIN_LOCKOUT", "");
+                } else {
+                    lastMessage = text("Nieprawidłowy PIN", "Incorrect PIN",
+                                       "PIN incorrecto", "Falsche PIN");
+                    addLog("WARN", "PIN_REJECTED", "");
+                }
             }
         } else if (pinInput.length() < 4) {
             const char* digits[] = {"1", "2", "3", "4", "5", "6", "7", "8", "9",
                                     "", "0", ""};
             pinInput += digits[key];
+            lastMessage = "";
         }
         if (screen == Screen::PinEntry || screen == Screen::PinChange ||
             screen == Screen::PinConfirm) {
@@ -4101,7 +4514,15 @@ void switchMode() {
     employees.clear();
     onlineEmployeesLoaded = false;
     offlineEmployeesLoaded = false;
-    onlineEmployeesLoaded = false;
+    offlineEmployeesTruncated = false;
+    employeeRefreshRequestId = 0;
+    attendanceStateRequestId = 0;
+    pendingQueueUploadRequestId = 0;
+    pendingEmployeeUpdateRequestId = 0;
+    pendingEmployeeRegistrationRequestId = 0;
+    pendingStatusRequestId = 0;
+    pendingStatusCheckInFlight = false;
+    pendingQueueBlockBannerShown = false;
     if (config.mode == Mode::Offline) {
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
@@ -4209,10 +4630,14 @@ void handleTouch() {
     }
     if (touchWasDown) return;
     touchWasDown = true;
+    if (screen != Screen::Home && screen != Screen::AttendanceConfirmation) {
+        screenSince = millis();
+    }
     if (screen == Screen::Home) {
         if (x >= 340 && x < 460 && y >= 270 && y < 306) {
             screen = Screen::PinEntry;
             pinInput = "";
+            lastMessage = "";
             screenSince = millis();
             drawPinEntry();
         }
@@ -4220,6 +4645,7 @@ void handleTouch() {
         if (y >= 215 && y < 277 && x < 240) {
             employeeEnrollmentRequested = true;
             pinInput = "";
+            lastMessage = "";
             screenSince = millis();
             screen = Screen::PinEntry;
             drawPinEntry();
@@ -4231,27 +4657,23 @@ void handleTouch() {
             drawHome();
         }
     } else if (screen == Screen::ActionChoice) {
-        if (outageActionChoice) {
+        if (y >= 252 && y < 298 && x >= 165 && x < 315) {
+            outageActionChoice = false;
+            selectedEmployee = Employee{};
+            lastMessage = "";
+            screen = Screen::Home;
+            drawHome();
+        } else if (outageActionChoice) {
             if (y >= 154 && y < 226 && x >= 25 && x < 230) {
                 processAttendance(AttendanceAction::Entry);
             } else if (y >= 154 && y < 226 && x >= 250 && x < 455) {
                 processAttendance(AttendanceAction::Exit);
-            } else if (selectedEmployee.relayAccess &&
-                       y >= 236 && y < 290 && x >= 115 && x < 365) {
-                outageActionChoice = false;
-                setRelay(true);
-                lastMessage = text("Drzwi odblokowane — brak połączenia",
-                                   "Door unlocked — no connection",
-                                   "Puerta abierta — sin conexión",
-                                   "Tür geöffnet — keine Verbindung");
-                screen = Screen::Home;
-                drawHome();
             }
         } else if (selectedEmployeePresent) {
             if (y >= 132 && y < 224 && x >= 30 && x < 230) {
                 processAttendance(AttendanceAction::Exit);
             } else if (y >= 132 && y < 224 && x >= 250 && x < 450) {
-                setRelay(true);
+                setRelay(true, selectedEmployee.id + ":" + selectedEmployee.uid);
                 lastMessage = text("Drzwi odblokowane", "Door unlocked",
                                    "Puerta desbloqueada", "Tür entriegelt");
                 screen = Screen::Home;
@@ -4410,6 +4832,9 @@ void handleTouch() {
                         (static_cast<uint8_t>(config.language) + 1) % 4);
                     preferences.putUChar("language",
                                          static_cast<uint8_t>(config.language));
+                    if (sdAvailable && configurationValid) {
+                        saveConfig();
+                    }
                     break;
                 case 1:
                     switchMode();
@@ -4457,6 +4882,12 @@ void handleTouch() {
                     drawEmployeeList();
                     return;
                 case 6:
+                    if (!rtcAvailable) {
+                        lastMessage = text("Brak zegara RTC", "RTC unavailable",
+                                           "RTC no disponible",
+                                           "RTC nicht verfügbar");
+                        break;
+                    }
                     screen = Screen::ClockSet;
                     drawClockSettings();
                     return;
@@ -4517,7 +4948,7 @@ void handleTouch() {
                 : 1;
         if (x >= 448 && x < 476 && y >= 48 && y < 244) {
             employeeListPage = static_cast<uint16_t>(scrollbarOffsetForTouch(
-                y, 48, 196, count, kRowsPerPage, employeeListPage));
+                y, 48, 196, pageCount, 1, employeeListPage));
         } else if (y >= 47 && y < 247) {
             const size_t row = static_cast<size_t>((y - 47) / 50);
             const int employeeIndex =
@@ -4588,12 +5019,197 @@ bool initDisplay() {
     return true;
 }
 
+uint32_t readFactoryResetRtcUnix() {
+    Wire.begin(pins::i2c_sda, pins::i2c_scl);
+    if (!rtc.begin(&Wire) || rtc.lostPower()) return 0;
+    return rtc.now().unixtime();
+}
+
+uint32_t factoryResetSequenceChecksum(const FactoryResetSequenceState& state) {
+    uint32_t checksum = state.magic ^ (state.count * 0x9E3779B9u);
+    checksum ^= static_cast<uint32_t>(state.lastResetUs);
+    checksum = (checksum << 13) | (checksum >> 19);
+    checksum ^= static_cast<uint32_t>(state.lastResetUs >> 32) * 0x85EBCA6Bu;
+    checksum ^= state.lastResetUnix * 0xC2B2AE35u;
+    return checksum;
+}
+
+bool factoryResetSequenceStateValid() {
+    return factoryResetSequenceState.magic == kFactoryResetSequenceMagic &&
+           factoryResetSequenceState.count <= 2 &&
+           factoryResetSequenceState.checksum ==
+               factoryResetSequenceChecksum(factoryResetSequenceState);
+}
+
+void clearFactoryResetSequence() {
+    factoryResetSequenceState.magic = 0;
+    factoryResetSequenceState.count = 0;
+    factoryResetSequenceState.lastResetUs = 0;
+    factoryResetSequenceState.lastResetUnix = 0;
+    factoryResetSequenceState.checksum = 0;
+    factoryResetStabilityPending = false;
+}
+
+void armFactoryResetSequence() {
+    factoryResetSequenceState.magic = kFactoryResetSequenceMagic;
+    factoryResetSequenceState.count = 0;
+    factoryResetSequenceState.lastResetUs = esp_rtc_get_time_us();
+    factoryResetSequenceState.lastResetUnix =
+        rtcAvailable ? rtc.now().unixtime() : 0;
+    factoryResetSequenceState.checksum =
+        factoryResetSequenceChecksum(factoryResetSequenceState);
+}
+
+void beginFactoryResetDetection() {
+    const esp_reset_reason_t resetReason = esp_reset_reason();
+    Serial.printf("Boot reset reason: %d\n", static_cast<int>(resetReason));
+
+    const bool stateValid = factoryResetSequenceStateValid();
+    const bool externalReset = resetReason == ESP_RST_EXT;
+    const bool retainedPowerOnReset =
+        resetReason == ESP_RST_POWERON && stateValid;
+    if (!externalReset && !retainedPowerOnReset) {
+        clearFactoryResetSequence();
+        return;
+    }
+
+    const uint64_t nowUs = esp_rtc_get_time_us();
+    const uint32_t nowUnix = readFactoryResetRtcUnix();
+    uint32_t count = 1;
+    if (stateValid && factoryResetSequenceState.count > 0) {
+        bool intervalMatched = false;
+        if (nowUs >= factoryResetSequenceState.lastResetUs) {
+            const uint64_t intervalUs =
+                nowUs - factoryResetSequenceState.lastResetUs;
+            intervalMatched = intervalUs >= kFactoryResetMinimumIntervalUs &&
+                              intervalUs <= kFactoryResetMaximumIntervalUs;
+        }
+        if (!intervalMatched && nowUnix != 0 &&
+            factoryResetSequenceState.lastResetUnix != 0 &&
+            nowUnix >= factoryResetSequenceState.lastResetUnix) {
+            const uint32_t intervalSec =
+                nowUnix - factoryResetSequenceState.lastResetUnix;
+            intervalMatched = intervalSec >= kFactoryResetMinimumIntervalSec &&
+                              intervalSec <= kFactoryResetMaximumIntervalSec;
+        }
+        if (intervalMatched) {
+            count = factoryResetSequenceState.count + 1;
+        }
+    }
+
+    factoryResetSequenceState.magic = kFactoryResetSequenceMagic;
+    factoryResetSequenceState.count = count;
+    factoryResetSequenceState.lastResetUs = nowUs;
+    factoryResetSequenceState.lastResetUnix = nowUnix;
+    factoryResetSequenceState.checksum =
+        factoryResetSequenceChecksum(factoryResetSequenceState);
+    Serial.printf("External reset sequence: %lu/3\n",
+                  static_cast<unsigned long>(count));
+
+    if (count < 3) return;
+
+    clearFactoryResetSequence();
+    Serial.println("Factory reset requested: erasing NVS");
+    const esp_err_t error = nvs_flash_erase();
+    if (error != ESP_OK) {
+        Serial.printf("Factory reset failed: nvs_flash_erase returned %s\n",
+                      esp_err_to_name(error));
+        return;
+    }
+    Serial.println("NVS erased; restarting for touchscreen calibration");
+    Serial.flush();
+    delay(50);
+    esp_restart();
+}
+
+void clearFactoryResetSequenceAfterStableUptime() {
+    if (!factoryResetStabilityPending ||
+        millis() - factoryResetStableSinceMs < kFactoryResetStablePeriodMs) {
+        return;
+    }
+    const bool hadPendingSequence = factoryResetSequenceStateValid() &&
+                                    factoryResetSequenceState.count > 0;
+    armFactoryResetSequence();
+    factoryResetStabilityPending = false;
+    if (hadPendingSequence) {
+        Serial.println(
+            "External reset sequence cleared after 5 seconds of stable operation");
+    }
+}
+
+void deselectSharedSpiDevices() {
+    pinMode(pins::tft_cs, OUTPUT);
+    digitalWrite(pins::tft_cs, HIGH);
+    pinMode(pins::touch_cs, OUTPUT);
+    digitalWrite(pins::touch_cs, HIGH);
+    pinMode(pins::sd_cs, OUTPUT);
+    digitalWrite(pins::sd_cs, HIGH);
+}
+
+void processFactoryResetFile() {
+    if (!sdAvailable || !SD.exists(kFactoryResetRequestPath)) return;
+
+    Serial.println("Found /reset.txt; removing NVS settings");
+    if (!SD.remove(kFactoryResetRequestPath) ||
+        SD.exists(kFactoryResetRequestPath)) {
+        Serial.println("Factory reset request could not be removed from SD");
+        return;
+    }
+
+    const esp_err_t error = nvs_flash_erase();
+    if (error != ESP_OK) {
+        Serial.printf("Factory reset failed: nvs_flash_erase returned %s\n",
+                      esp_err_to_name(error));
+        return;
+    }
+
+    SD.end();
+    deselectSharedSpiDevices();
+
+    Serial.println("NVS erased; restarting for touchscreen calibration");
+    Serial.flush();
+    delay(50);
+    esp_restart();
+}
+
+void recoverBackupFileIfMissing(const char* primaryPath, const char* backupPath) {
+    if (!sdAvailable) return;
+    if (!SD.exists(primaryPath) && SD.exists(backupPath)) {
+        if (SD.rename(backupPath, primaryPath)) {
+            Serial.printf("Recovered %s from %s\n", primaryPath, backupPath);
+        } else {
+            Serial.printf("Failed to recover %s from %s\n", primaryPath, backupPath);
+        }
+    }
+}
+
 void setupRcp() {
-    Serial.begin(115200);
+    digitalWrite(pins::relay, HIGH);
+    pinMode(pins::relay, OUTPUT_OPEN_DRAIN);
+    digitalWrite(pins::relay, HIGH);
+    pinMode(pins::buzzer, OUTPUT);
+    digitalWrite(pins::buzzer, LOW);
+
+    deselectSharedSpiDevices();
     const bool displayReady = initDisplay();
     if (!displayReady) {
         Serial.println("ILI9488 initialization failed");
     }
+
+    deselectSharedSpiDevices();
+    sdBus.begin(pins::tft_sck, pins::tft_miso, pins::tft_mosi, pins::sd_cs);
+    sdAvailable = SD.begin(pins::sd_cs, sdBus, 20000000);
+    if (!sdAvailable) {
+        Serial.println("SD mount failed at 20 MHz; retrying at 4 MHz");
+        sdAvailable = SD.begin(pins::sd_cs, sdBus, 4000000);
+    }
+    if (!sdAvailable) {
+        Serial.println("SD initialization failed before settings and calibration load");
+    } else {
+        Serial.printf("SD mounted, card size: %llu bytes\n",
+                      static_cast<unsigned long long>(SD.cardSize()));
+    }
+    processFactoryResetFile();
 
     preferences.begin("rcp", false);
     networkWorkerReady = initializeNetworkWorker();
@@ -4606,6 +5222,14 @@ void setupRcp() {
         preferences.remove("pend_emp");
         preferences.remove("pending_name");
         preferences.remove("pending_payload");
+    } else if (!pendingAttendanceRequestBody.isEmpty()) {
+        JsonDocument pendingDoc;
+        if (deserializeJson(pendingDoc, pendingAttendanceRequestBody) ==
+            DeserializationError::Ok) {
+            const String action = pendingDoc["action"] | "";
+            pendingAttendanceAutomatic = (action == "punch");
+            pendingAttendanceExpectedType = pendingDoc["row"]["event_type"] | "";
+        }
     }
     const bool savedLanguage = preferences.isKey("language");
     const bool savedCamera = preferences.isKey("camera");
@@ -4630,8 +5254,6 @@ void setupRcp() {
         Serial.println("RTC lost power; set to firmware build time");
     }
 
-    pinMode(pins::relay, OUTPUT_OPEN_DRAIN);
-    digitalWrite(pins::relay, HIGH);
     esp_timer_create_args_t relayTimerConfig = {};
     relayTimerConfig.callback = relayTimerCallback;
     relayTimerConfig.name = "rcp-relay-close";
@@ -4639,12 +5261,11 @@ void setupRcp() {
         relayTimer = nullptr;
         Serial.println("Relay safety timer creation failed; using loop timeout");
     }
-    pinMode(pins::buzzer, OUTPUT);
-    digitalWrite(pins::buzzer, LOW);
 
-    sdBus.begin(pins::tft_sck, pins::tft_miso, pins::tft_mosi, pins::sd_cs);
-    sdAvailable = SD.begin(pins::sd_cs, sdBus, 20000000);
     if (sdAvailable) {
+        recoverBackupFileIfMissing(kEmployeesPath, "/employees.csv.bak");
+        recoverBackupFileIfMissing(kPendingAttendancePath,
+                                   "/attendance_pending.csv.bak");
         loadWallpaper();
         const bool employeesFileReady = ensureCsvFile(
             kEmployeesPath,
@@ -4659,9 +5280,10 @@ void setupRcp() {
         if (!pendingAttendanceFileReady) {
             Serial.println("Could not initialize temporary online attendance queue");
         }
+        refreshPendingOnlineAttendanceFlag();
         sdFilesInitialized = employeesFileReady && attendanceFileReady && logsFileReady;
 
-        if (!SD.exists(kConfigPath)) {
+        if (!SD.exists(kConfigPath) && !SD.exists(kConfigBackupPath)) {
             config.mode = Mode::Offline;
             config.language = Language::Polish;
             configurationValid = saveConfig();
@@ -4671,7 +5293,21 @@ void setupRcp() {
                 Serial.println("Could not create default offline config.json");
             }
         } else if (!loadConfig()) {
-            addLog("ERROR", "CONFIG_INVALID", "Invalid config.json; refusing defaults");
+            addLog("ERROR", "CONFIG_INVALID",
+                   "No valid config.json or config.json.bak; refusing defaults");
+        } else if (configLoadedFromBackup) {
+            if (!saveConfig()) {
+                Serial.println("Using emergency configuration; could not repair config.json");
+            }
+        } else {
+            Config primaryConfig = config;
+            const bool backupMatches = SD.exists(kConfigBackupPath) &&
+                                       loadConfigFile(kConfigBackupPath) &&
+                                       configsEqual(primaryConfig, config);
+            config = primaryConfig;
+            if (!backupMatches && !saveConfig()) {
+                Serial.println("Configuration loaded, but emergency backup could not be refreshed");
+            }
         }
     } else {
         Serial.println("SD initialization failed");
@@ -4720,7 +5356,12 @@ void setupRcp() {
     tone(pins::buzzer, 2500, 300);
     delay(300);
     noTone(pins::buzzer);
-    if (!configurationValid) {
+    if (!sdAvailable) {
+        lastMessage = text("Brak dostępu do karty SD",
+                           "SD card unavailable",
+                           "No se puede acceder a la tarjeta SD",
+                           "Kein Zugriff auf SD-Karte");
+    } else if (!configurationValid) {
         lastMessage = text("Brak poprawnej konfiguracji SD",
                            "Invalid or missing SD configuration",
                            "Configuración SD ausente o inválida",
@@ -4773,6 +5414,8 @@ void setupRcp() {
                   displayReady ? "ok" : "error", sdAvailable ? "ok" : "error",
                   rtcAvailable ? "ok" : "error", rfidAvailable ? "ok" : "error",
                   static_cast<unsigned>(employees.size()));
+    factoryResetStabilityPending = true;
+    factoryResetStableSinceMs = millis();
 }
 
 void expireNetworkRequests() {
@@ -4853,6 +5496,7 @@ void expireNetworkRequests() {
 }
 
 void loopRcp() {
+    clearFactoryResetSequenceAfterStableUptime();
     expireNetworkRequests();
     handleAsyncNetworkResults();
     updateWifiProgress();
@@ -4900,7 +5544,8 @@ void loopRcp() {
                 if (screen == Screen::Home) drawHome();
             }
             WiFi.reconnect();
-        } else if (!onlineEmployeesLoaded || millis() >= nextEmployeeRefreshAt) {
+        } else if (!onlineEmployeesLoaded ||
+                   static_cast<int32_t>(millis() - nextEmployeeRefreshAt) >= 0) {
             const String disconnectedMessage =
                 text("BRAK POŁĄCZENIA Wi-Fi", "NO WI-Fi CONNECTION",
                      "SIN CONEXIÓN Wi-Fi", "KEINE Wi-Fi-VERBINDUNG");
@@ -4917,10 +5562,48 @@ void loopRcp() {
         pendingQueueUploadRequestId == 0) {
         startPendingOnlineAttendanceUpload();
     }
+    if (!hasPendingOnlineAttendance()) {
+        pendingQueueBlockBannerShown = false;
+    }
 
     if (screen == Screen::Home && millis() - lastClockDraw >= kClockRefreshMs) {
         lastClockDraw = millis();
         refreshHomeClock();
+    }
+    if (screen == Screen::ActionChoice &&
+        millis() - screenSince > kActionChoiceTimeoutMs) {
+        outageActionChoice = false;
+        selectedEmployee = Employee{};
+        lastMessage = "";
+        screen = Screen::Home;
+        drawHome();
+    }
+    if (screen == Screen::UnknownCard &&
+        millis() - screenSince > kUnknownCardTimeoutMs) {
+        pendingEmployeeUid = "";
+        employeeEnrollmentRequested = false;
+        lastMessage = "";
+        screen = Screen::Home;
+        drawHome();
+    }
+    if (screen == Screen::AddEmployeeCard &&
+        millis() - screenSince > kAddEmployeeCardTimeoutMs) {
+        employeeManagementReturnToList = false;
+        lastMessage = "";
+        screen = Screen::Home;
+        drawHome();
+    }
+    if ((screen == Screen::Settings || screen == Screen::EmployeeList ||
+         screen == Screen::ClockSet || screen == Screen::WifiSetup ||
+         (screen == Screen::WifiPassword && !wifiConnecting)) &&
+        millis() - screenSince > kSettingsTimeoutMs) {
+        if (wifiSetupActive) restoreWifiAfterSetup();
+        wifiStatusMessage = "";
+        wifiPasswordInput = "";
+        employeeManagementReturnToList = false;
+        lastMessage = "";
+        screen = Screen::Home;
+        drawHome();
     }
     if ((screen == Screen::PinEntry || screen == Screen::PinChange ||
          screen == Screen::PinConfirm) &&
@@ -4947,6 +5630,8 @@ void loopRcp() {
 }  // namespace
 
 void setup() {
+    Serial.begin(115200);
+    beginFactoryResetDetection();
     setupRcp();
 }
 

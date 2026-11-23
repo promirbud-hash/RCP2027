@@ -122,6 +122,37 @@ The Wi-Fi password and API token are plain text on removable media. Restrict
 physical access to the card and regenerate credentials if it is lost. Do not
 commit a device-specific configuration file to a public repository.
 
+The firmware keeps a validated emergency copy at `/config.json.bak`. At startup
+it uses this copy if `/config.json` is missing or invalid, then attempts to
+repair the primary file. When the primary file is valid but the backup is
+missing, invalid, or differs from `/config.json`, the firmware refreshes the
+backup. If neither file is valid, the terminal refuses to start attendance
+rather than silently switching operating modes. Keep both files together on the
+SD card.
+
+### Factory reset
+
+At SD-card initialization, the firmware checks for `/reset.txt` without
+reading its contents. If present, it removes the file, erases the default NVS
+partition, and restarts before touchscreen calibration is loaded. On the next
+boot the missing calibration causes the existing touch-calibration flow to
+run. The card must mount and the file must be removable.
+
+Three distinct external `RST`/`EN` resets, 1–2 seconds apart, erase the default
+NVS partition and restart the terminal. The detector runs at the start of
+`setup()`, before display, peripheral, and calibration initialization. Its
+counter and RTC-time timestamp are stored in `RTC_NOINIT_ATTR` memory, avoiding
+flash writes; a checksum rejects uninitialized or corrupted retained data.
+`ESP_RST_EXT` advances the sequence. Some ESP32-S3 boards report an EN reset
+as `ESP_RST_POWERON` and reset the internal RTC timer; that reason is accepted
+when the checksummed RTC state was retained, using the internal RTC timer or
+the external DS3231 RTC as a fallback interval check. A cold power-on
+without retained state, brownout, watchdog, software, and other reset reasons
+clear the sequence. After five seconds in the main loop, an unfinished count
+is cleared and a fresh RTC baseline is armed. After NVS is erased, the existing
+missing-calibration path starts touchscreen calibration on the restarted boot.
+The operation does not erase SD-card files.
+
 From the PIN-protected settings, the operator can scan for visible Wi-Fi
 networks, select one, enter its password on the touchscreen, and test the
 connection. The terminal updates `wifi_ssid` and `wifi_password` on the SD card
