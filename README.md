@@ -46,15 +46,21 @@ and German.
   An available SD card is required.
 - Cards with relay access can record entry when the employee is outside the
   facility; after entry, they can choose to record an exit or briefly unlock
-  the door.
-- Unknown cards can be enrolled at the terminal after confirmation and PIN
-  entry.
-- PIN-protected settings include language, operating mode, photos, seven font
-  styles (Unicode, regular or bold Sans/Serif/Mono), light or dark color mode,
-  employee list, date and time, PIN changes, and touch calibration. Wi-Fi
-  settings allow the user to select a network, enter its password, and save
-  the configuration to `config.json` on the SD card after a successful
-  connection.
+  the door (door unlocks log the employee ID). The action-choice screen
+  includes a **Cancel** button and returns to the home screen automatically
+  after 30 seconds of inactivity; during a Wi-Fi outage, door unlock is
+  disabled until attendance state can be verified.
+- Deactivated cards (`active=false`) display a **Card inactive** message
+  instead of prompting for enrollment. Unknown cards can be enrolled at the
+  terminal after confirmation and PIN entry.
+- PIN-protected settings (with a 30-second lockout after 5 consecutive wrong
+  attempts and automatic inactivity timeout) include language, operating mode,
+  photos, seven font styles (Unicode, regular or bold Sans/Serif/Mono), light
+  or dark color mode, employee list, date and time, PIN changes, and touch
+  calibration. Wi-Fi settings allow the user to select a network, enter its
+  password, and save the configuration to `config.json` on the SD card after a
+  successful connection. Language changes on the terminal also update
+  `config.json` when the SD card is available.
 - Employee management can change relay permissions and deactivate employees
   without deleting their history. New employees can be added by scanning a
   new card.
@@ -67,9 +73,10 @@ and German.
   the calibration is stored in persistent memory.
 - Logs are saved to `/logs.csv` on the SD card in both operating modes. In
   online mode, they are also sent to the configured spreadsheet.
-- When enabled and the camera is available, photos are saved under `/photos`
-  on the SD card as `surname_firstname_id_YYYYMMDD_HHMM.jpg`. An event ID is
-  added if a filename already exists so that photos are not overwritten.
+- When enabled and the camera is available, fresh photos are saved under
+  `/photos` on the SD card with ASCII-transliterated filenames
+  (`surname_firstname_id_YYYYMMDD_HHMM.jpg`). An event ID is added if a
+  filename already exists so that photos are not overwritten.
 
 ## Desktop application
 
@@ -100,9 +107,10 @@ files with headers, and creates the `photos` directory. Existing CSV files and
 records are preserved. Missing CSV files are also created automatically when
 an SD card directory is selected.
 On the terminal's first successful boot, the firmware creates
-`config.json.bak` as an emergency copy. If `config.json` is later missing or
-invalid, the firmware attempts to load and restore the backup. Keep both files
-on the card; the desktop application does not create or manage the backup.
+`config.json.bak` as an emergency copy and refreshes it whenever `config.json`
+is updated. If `config.json` is later missing or invalid, the firmware attempts
+to load and restore the backup. Keep both files on the card; the desktop
+application does not create or manage the backup.
 
 Offline mode can start with an empty employee list; add the first card at the
 terminal or in the desktop application. To view attendance records or logs,
@@ -160,9 +168,11 @@ To clear the terminal's NVS settings, press and release the board's `RST`/`EN`
 button three times. The next reset must occur 1–2 seconds after the previous
 one. The sequence is accepted only for external resets; watchdog resets,
 software restarts, brownouts, and cold power-on boots cancel it. Some ESP32-S3
-boards report an `EN` reset as power-on; this is accepted only if the RTC
-sequence state was retained. The counter is kept in RTC no-init memory (not
-written to flash) and is cleared after five seconds of stable operation.
+boards report an `EN` reset as power-on and reset the internal RTC timer; this
+is accepted when the checksummed RTC state was retained, using the internal RTC
+timer or the external DS3231 RTC as a fallback interval check. The counter is
+kept in RTC no-init memory (not written to flash) and is cleared after five
+seconds of stable operation.
 
 On the third qualifying reset, the firmware erases NVS and restarts. The
 missing touchscreen calibration is then detected and calibration starts during
