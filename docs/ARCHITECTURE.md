@@ -132,13 +132,16 @@ SD card.
 
 ### Factory reset
 
-At SD-card initialization, the firmware checks for `/reset.txt` without
-reading its contents. If present, it removes the file, erases the default NVS
-partition, and restarts before touchscreen calibration is loaded. On the next
-boot the missing calibration causes the existing touch-calibration flow to
-run. The card must mount and the file must be removable.
+The user-accessible factory reset uses an empty `/reset.txt` file on the SD
+card (no need to open the enclosure). At SD-card initialization, the firmware
+checks for `/reset.txt` without reading its contents. If present, it removes
+the file, erases the default NVS partition, and restarts before touchscreen
+calibration is loaded. On the next boot the missing calibration causes the
+existing touch-calibration flow to run. The card must mount and the file must
+be removable.
 
-Three distinct external `RST`/`EN` resets, 1–2 seconds apart, erase the default
+For bench/service maintenance with the enclosure opened, three distinct
+external `RST`/`EN` board resets, 1–2 seconds apart, also erase the default
 NVS partition and restart the terminal. The detector runs at the start of
 `setup()`, before display, peripheral, and calibration initialization. Its
 counter and RTC-time timestamp are stored in `RTC_NOINIT_ATTR` memory, avoiding

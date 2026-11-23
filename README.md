@@ -159,25 +159,20 @@ attendance history.
 
 ## Factory reset
 
-As an alternative, create an empty `reset.txt` file in the root of the SD card.
-Its contents are ignored. At startup the terminal removes the file, erases NVS,
-and restarts; touchscreen calibration then starts. The file must be removable
-and the SD card must mount successfully.
+To reset the terminal's NVS settings (including the PIN back to `0000` and
+touchscreen calibration) without opening the enclosure, create an empty
+`reset.txt` file in the root of the SD card and start the terminal. Its
+contents are ignored. At startup the terminal removes the file, erases NVS,
+and restarts directly into touchscreen calibration. The SD card must mount and
+the file must be removable. This does not erase SD-card files or attendance
+records.
 
-To clear the terminal's NVS settings, press and release the board's `RST`/`EN`
-button three times. The next reset must occur 1–2 seconds after the previous
-one. The sequence is accepted only for external resets; watchdog resets,
-software restarts, brownouts, and cold power-on boots cancel it. Some ESP32-S3
-boards report an `EN` reset as power-on and reset the internal RTC timer; this
-is accepted when the checksummed RTC state was retained, using the internal RTC
-timer or the external DS3231 RTC as a fallback interval check. The counter is
-kept in RTC no-init memory (not written to flash) and is cleared after five
-seconds of stable operation.
-
-On the third qualifying reset, the firmware erases NVS and restarts. The
-missing touchscreen calibration is then detected and calibration starts during
-boot. This clears settings stored in NVS, including the PIN and touch
-calibration, but does not erase SD-card files or attendance records.
+For service or bench maintenance (with the enclosure opened), the firmware
+also supports pressing and releasing the internal ESP32-S3 board `RST`/`EN`
+button three times at 1–2 second intervals (after 5 seconds of stable
+operation). The sequence uses checksummed `RTC_NOINIT_ATTR` memory with an
+internal RTC or external DS3231 interval check and clears only NVS, leaving
+SD-card files intact.
 
 ## Google Apps Script setup
 
