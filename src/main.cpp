@@ -48,6 +48,8 @@ constexpr char kFactoryResetRequestPath[] = "/reset.txt";
 constexpr char kEmployeesPath[] = "/employees.csv";
 constexpr char kAttendancePath[] = "/attendance.csv";
 constexpr char kPendingAttendancePath[] = "/attendance_pending.csv";
+constexpr char kPendingOnlineEventPath[] = "/pending_online_event.json";
+constexpr char kPendingOnlineEventBackupPath[] = "/pending_online_event.json.bak";
 constexpr char kAttendanceHeader[] =
     "event_id,timestamp,employee_id,card_uid,event_type,photo_file,source,notes";
 constexpr char kLogsPath[] = "/logs.csv";
@@ -511,11 +513,14 @@ bool pendingQueueSyncFailed = false;
 String pendingQueueUploadEventId;
 bool pendingAttendanceAutomatic = false;
 bool pendingAttendanceApiRejected = false;
+bool pendingOnlineEventPersistedOnSd = false;
+bool pendingOnlineEventPersistedRejected = false;
 String pendingAttendanceExpectedType;
 String pendingAttendanceRequestBody;
 Employee pendingEmployeeUpdate;
 Employee pendingEmployeeRegistration;
-constexpr char kGoogleRootCertificate[] =
+constexpr char kGoogleRootCertificates[] =
+    // GTS Root R1 (valid until 2036-06-22)
     "-----BEGIN CERTIFICATE-----\n"
     "MIIFVzCCAz+gAwIBAgINAgPlk28xsBNJiGuiFzANBgkqhkiG9w0BAQwFADBHMQsw\n"
     "CQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEU\n"
@@ -546,6 +551,66 @@ constexpr char kGoogleRootCertificate[] =
     "0E6yove+7u7Y/9waLd64NnHi/Hm3lCXRSHNboTXns5lndcEZOitHTtNCjv0xyBZm\n"
     "2tIMPNuzjsmhDYAPexZ3FL//2wmUspO8IFgV6dtxQ/PeEMMA3KgqlbbC1j+Qa3bb\n"
     "bP6MvPJwNQzcmRk13NfIRmPVNnGuV/u3gm3c\n"
+    "-----END CERTIFICATE-----\n"
+    // GTS Root R2 (valid until 2036-06-22)
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIFVzCCAz+gAwIBAgINAgPlrsWNBCUaqxElqjANBgkqhkiG9w0BAQwFADBHMQsw\n"
+    "CQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEU\n"
+    "MBIGA1UEAxMLR1RTIFJvb3QgUjIwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAw\n"
+    "MDAwWjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZp\n"
+    "Y2VzIExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjIwggIiMA0GCSqGSIb3DQEBAQUA\n"
+    "A4ICDwAwggIKAoICAQDO3v2m++zsFDQ8BwZabFn3GTXd98GdVarTzTukk3LvCvpt\n"
+    "nfbwhYBboUhSnznFt+4orO/LdmgUud+tAWyZH8QiHZ/+cnfgLFuv5AS/T3KgGjSY\n"
+    "6Dlo7JUle3ah5mm5hRm9iYz+re026nO8/4Piy33B0s5Ks40FnotJk9/BW9BuXvAu\n"
+    "MC6C/Pq8tBcKSOWIm8Wba96wyrQD8Nr0kLhlZPdcTK3ofmZemde4wj7I0BOdre7k\n"
+    "RXuJVfeKH2JShBKzwkCX44ofR5GmdFrS+LFjKBC4swm4VndAoiaYecb+3yXuPuWg\n"
+    "f9RhD1FLPD+M2uFwdNjCaKH5wQzpoeJ/u1U8dgbuak7MkogwTZq9TwtImoS1mKPV\n"
+    "+3PBV2HdKFZ1E66HjucMUQkQdYhMvI35ezzUIkgfKtzra7tEscszcTJGr61K8Yzo\n"
+    "dDqs5xoic4DSMPclQsciOzsSrZYuxsN2B6ogtzVJV+mSSeh2FnIxZyuWfoqjx5RW\n"
+    "Ir9qS34BIbIjMt/kmkRtWVtd9QCgHJvGeJeNkP+byKq0rxFROV7Z+2et1VsRnTKa\n"
+    "G73VululycslaVNVJ1zgyjbLiGH7HrfQy+4W+9OmTN6SpdTi3/UGVN4unUu0kzCq\n"
+    "gc7dGtxRcw1PcOnlthYhGXmy5okLdWTK1au8CcEYof/UVKGFPP0UJAOyh9OktwID\n"
+    "AQABo0IwQDAOBgNVHQ8BAf8EBAMCAYYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4E\n"
+    "FgQUu//KjiOfT5nK2+JopqUVJxce2Q4wDQYJKoZIhvcNAQEMBQADggIBAB/Kzt3H\n"
+    "vqGf2SdMC9wXmBFqiN495nFWcrKeGk6c1SuYJF2ba3uwM4IJvd8lRuqYnrYb/oM8\n"
+    "0mJhwQTtzuDFycgTE1XnqGOtjHsB/ncw4c5omwX4Eu55MaBBRTUoCnGkJE+M3DyC\n"
+    "B19m3H0Q/gxhswWV7uGugQ+o+MePTagjAiZrHYNSVc61LwDKgEDg4XSsYPWHgJ2u\n"
+    "NmSRXbBoGOqKYcl3qJfEycel/FVL8/B/uWU9J2jQzGv6U53hkRrJXRqWbTKH7QMg\n"
+    "yALOWr7Z6v2yTcQvG99fevX4i8buMTolUVVnjWQye+mew4K6Ki3pHrTgSAai/Gev\n"
+    "HyICc/sgCq+dVEuhzf9gR7A/Xe8bVr2XIZYtCtFenTgCR2y59PYjJbigapordwj6\n"
+    "xLEokCZYCDzifqrXPW+6MYgKBesntaFJ7qBFVHvmJ2WZICGoo7z7GJa7Um8M7YNR\n"
+    "TOlZ4iBgxcJlkoKM8xAfDoqXvneCbT+PHV28SSe9zE8P4c52hgQjxcCMElv924Sg\n"
+    "JPFI/2R80L5cFtHvma3AH/vLrrw4IgYmZNralw4/KBVEqE8AyvCazM90arQ+POuV\n"
+    "7LXTWtiBmelDGDfrs7vRWGJB82bSj6p4lVQgw1oudCvV0b4YacCs1aTPObpRhANl\n"
+    "6WLAYv7YTVWW4tAR+kg0Eeye7QUd5MjWHYbL\n"
+    "-----END CERTIFICATE-----\n"
+    // GTS Root R3 (valid until 2036-06-22)
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIICCTCCAY6gAwIBAgINAgPluILrIPglJ209ZjAKBggqhkjOPQQDAzBHMQswCQYD\n"
+    "VQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEUMBIG\n"
+    "A1UEAxMLR1RTIFJvb3QgUjMwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAwMDAw\n"
+    "WjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2Vz\n"
+    "IExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjMwdjAQBgcqhkjOPQIBBgUrgQQAIgNi\n"
+    "AAQfTzOHMymKoYTey8chWEGJ6ladK0uFxh1MJ7x/JlFyb+Kf1qPKzEUURout736G\n"
+    "jOyxfi//qXGdGIRFBEFVbivqJn+7kAHjSxm65FSWRQmx1WyRRK2EE46ajA2ADDL2\n"
+    "4CejQjBAMA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQW\n"
+    "BBTB8Sa6oC2uhYHP0/EqEr24Cmf9vDAKBggqhkjOPQQDAwNpADBmAjEA9uEglRR7\n"
+    "VKOQFhG/hMjqb2sXnh5GmCCbn9MN2azTL818+FsuVbu/3ZL3pAzcMeGiAjEA/Jdm\n"
+    "ZuVDFhOD3cffL74UOO0BzrEXGhF16b0DjyZ+hOXJYKaV11RZt+cRLInUue4X\n"
+    "-----END CERTIFICATE-----\n"
+    // GTS Root R4 (valid until 2036-06-22)
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIICCTCCAY6gAwIBAgINAgPlwGjvYxqccpBQUjAKBggqhkjOPQQDAzBHMQswCQYD\n"
+    "VQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEUMBIG\n"
+    "A1UEAxMLR1RTIFJvb3QgUjQwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAwMDAw\n"
+    "WjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2Vz\n"
+    "IExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjQwdjAQBgcqhkjOPQIBBgUrgQQAIgNi\n"
+    "AATzdHOnaItgrkO4NcWBMHtLSZ37wWHO5t5GvWvVYRg1rkDdc/eJkTBa6zzuhXyi\n"
+    "QHY7qca4R9gq55KRanPpsXI5nymfopjTX15YhmUPoYRlBtHci8nHc8iMai/lxKvR\n"
+    "HYqjQjBAMA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQW\n"
+    "BBSATNbrdP9JNqPV2Py1PsVq8JQdjDAKBggqhkjOPQQDAwNpADBmAjEA6ED/g94D\n"
+    "9J+uHXqnLrmvT/aDHQ4thQEd0dlq7A/Cr8deVl5c1RxYIigL9zC2L7F8AjEA8GE8\n"
+    "p/SgguMh1YQdc4acLa/KNJvxn7kjNuK8YAOdgLOaVsjh4rsUecrNIdSUtUlD\n"
     "-----END CERTIFICATE-----\n";
 
 uint16_t color(uint8_t red, uint8_t green, uint8_t blue) {
@@ -849,7 +914,7 @@ bool performAppsScriptPost(const String& url, const String& body,
         return false;
     }
     WiFiClientSecure secureClient;
-    secureClient.setCACert(kGoogleRootCertificate);
+    secureClient.setCACert(kGoogleRootCertificates);
 
     const char* headerKeys[] = {"Location"};
     String currentUrl = url;
@@ -1825,10 +1890,71 @@ bool removePendingOnlineAttendance(const String& eventId) {
     return true;
 }
 
+void removePendingOnlineAttendanceFromSd() {
+    if (sdAvailable) {
+        SD.remove(kPendingOnlineEventPath);
+        SD.remove("/pending_online_event.json.tmp");
+        SD.remove(kPendingOnlineEventBackupPath);
+    }
+    pendingOnlineEventPersistedOnSd = false;
+    pendingOnlineEventPersistedRejected = false;
+}
+
+bool persistPendingOnlineAttendanceToSd() {
+    if (pendingOnlineEventId.isEmpty() || !sdAvailable) return false;
+    if (pendingOnlineEventPersistedOnSd &&
+        pendingOnlineEventPersistedRejected == pendingAttendanceApiRejected) {
+        return true;
+    }
+    constexpr char temporaryPath[] = "/pending_online_event.json.tmp";
+    SD.remove(temporaryPath);
+    SD.remove(kPendingOnlineEventBackupPath);
+
+    JsonDocument doc;
+    doc["event_id"] = pendingOnlineEventId;
+    doc["employee_id"] = pendingOnlineEmployeeId;
+    doc["employee_name"] = pendingOnlineEmployeeName;
+    doc["automatic"] = pendingAttendanceAutomatic;
+    doc["expected_type"] = pendingAttendanceExpectedType;
+    doc["api_rejected"] = pendingAttendanceApiRejected;
+    doc["payload"] = pendingAttendanceRequestBody;
+
+    File file = SD.open(temporaryPath, FILE_WRITE);
+    if (!file) {
+        Serial.println("Could not write pending online event to SD");
+        return false;
+    }
+    const size_t expectedBytes = measureJson(doc);
+    const size_t written = serializeJson(doc, file);
+    file.flush();
+    const bool writeOk = written == expectedBytes && file.getWriteError() == 0;
+    file.close();
+    if (!writeOk) {
+        SD.remove(temporaryPath);
+        Serial.println("Incomplete write for pending online event on SD");
+        return false;
+    }
+
+    const bool hadOriginal = SD.exists(kPendingOnlineEventPath);
+    if (hadOriginal &&
+        !SD.rename(kPendingOnlineEventPath, kPendingOnlineEventBackupPath)) {
+        SD.remove(temporaryPath);
+        return false;
+    }
+    if (!SD.rename(temporaryPath, kPendingOnlineEventPath)) {
+        if (hadOriginal) {
+            SD.rename(kPendingOnlineEventBackupPath, kPendingOnlineEventPath);
+        }
+        SD.remove(temporaryPath);
+        return false;
+    }
+    SD.remove(kPendingOnlineEventBackupPath);
+    pendingOnlineEventPersistedOnSd = true;
+    pendingOnlineEventPersistedRejected = pendingAttendanceApiRejected;
+    return true;
+}
+
 void clearPendingOnlineAttendance() {
-    preferences.remove("pending_event");
-    preferences.remove("pend_emp");
-    preferences.remove("pending_name");
     pendingOnlineEventId = "";
     pendingOnlineEmployeeId = "";
     pendingOnlineEmployeeName = "";
@@ -1841,7 +1967,9 @@ void clearPendingOnlineAttendance() {
     pendingAttendanceApiRejected = false;
     pendingAttendanceExpectedType = "";
     pendingAttendanceRequestBody = "";
-    preferences.remove("pending_payload");
+    if (pendingOnlineEventPersistedOnSd) {
+        removePendingOnlineAttendanceFromSd();
+    }
 }
 
 void resolvePendingAttendance(const String& eventType) {
@@ -2174,14 +2302,17 @@ void handleAsyncNetworkResults() {
                     if (eventType == "ENTRY" || eventType == "EXIT") {
                         if (!pendingAttendanceAutomatic &&
                             eventType != pendingAttendanceExpectedType) {
+                            persistPendingOnlineAttendanceToSd();
                             nextPendingStatusAttemptAt = millis();
                         } else {
                             resolvePendingAttendance(eventType);
                         }
                     } else {
+                        persistPendingOnlineAttendanceToSd();
                         nextPendingStatusAttemptAt = millis();
                     }
                 } else {
+                    persistPendingOnlineAttendanceToSd();
                     nextPendingStatusAttemptAt = millis();
                 }
             } else {
@@ -2192,6 +2323,7 @@ void handleAsyncNetworkResults() {
                     !(errorResponse["ok"] | true)) {
                     pendingAttendanceApiRejected = true;
                 }
+                persistPendingOnlineAttendanceToSd();
                 nextPendingStatusAttemptAt = millis();
             }
         } else if (pendingStatusRequestId != 0 &&
@@ -2248,6 +2380,8 @@ bool queueOnlineAttendance(const Employee& employee, AttendanceAction action,
     pendingAttendanceAutomatic = automatic;
     pendingAttendanceExpectedType =
         action == AttendanceAction::Entry ? "ENTRY" : "EXIT";
+    pendingOnlineEventPersistedOnSd = false;
+    pendingOnlineEventPersistedRejected = false;
     JsonDocument request;
     request["action"] = automatic ? "punch" : "attendance";
     JsonObject row = request["row"].to<JsonObject>();
@@ -2263,21 +2397,6 @@ bool queueOnlineAttendance(const Employee& employee, AttendanceAction action,
     employeeName.trim();
     if (employeeName.isEmpty()) employeeName = employee.id;
     serializeJson(request, pendingAttendanceRequestBody);
-    if (preferences.putString("pend_emp", employee.id) == 0 ||
-        preferences.putString("pending_payload", pendingAttendanceRequestBody) == 0 ||
-        preferences.putString("pending_name", employeeName) == 0 ||
-        preferences.putString("pending_event", eventId) == 0) {
-        preferences.remove("pending_event");
-        preferences.remove("pend_emp");
-        preferences.remove("pending_payload");
-        preferences.remove("pending_name");
-        pendingAttendanceRequestBody = "";
-        lastMessage = text("Nie można zabezpieczyć ID zdarzenia",
-                           "Could not persist event ID",
-                           "No se pudo guardar el ID del evento",
-                           "Ereignis-ID konnte nicht gesichert werden");
-        return false;
-    }
     pendingOnlineEventId = eventId;
     pendingOnlineEmployeeId = employee.id;
     pendingOnlineEmployeeName = employeeName;
@@ -4520,8 +4639,14 @@ void switchMode() {
     pendingQueueUploadRequestId = 0;
     pendingEmployeeUpdateRequestId = 0;
     pendingEmployeeRegistrationRequestId = 0;
+    pendingAttendanceRequestId = 0;
+    pendingAttendanceRequestStartedAt = 0;
     pendingStatusRequestId = 0;
+    pendingStatusRequestStartedAt = 0;
     pendingStatusCheckInFlight = false;
+    if (!pendingOnlineEventId.isEmpty()) {
+        persistPendingOnlineAttendanceToSd();
+    }
     pendingQueueBlockBannerShown = false;
     if (config.mode == Mode::Offline) {
         WiFi.disconnect(true);
@@ -5183,6 +5308,61 @@ void recoverBackupFileIfMissing(const char* primaryPath, const char* backupPath)
     }
 }
 
+bool loadPendingOnlineAttendanceFromSd() {
+    if (!sdAvailable) return false;
+    SD.remove("/pending_online_event.json.tmp");
+    recoverBackupFileIfMissing(kPendingOnlineEventPath,
+                               kPendingOnlineEventBackupPath);
+    if (!SD.exists(kPendingOnlineEventPath)) return false;
+
+    File file = SD.open(kPendingOnlineEventPath, FILE_READ);
+    if (!file) {
+        Serial.println("Could not open pending online event file on SD");
+        return false;
+    }
+    JsonDocument doc;
+    const DeserializationError error = deserializeJson(doc, file);
+    file.close();
+    if (error != DeserializationError::Ok) {
+        Serial.println("Corrupt pending online event file on SD; removing");
+        removePendingOnlineAttendanceFromSd();
+        return false;
+    }
+    const String eventId = doc["event_id"] | "";
+    if (eventId.isEmpty()) {
+        removePendingOnlineAttendanceFromSd();
+        return false;
+    }
+    pendingOnlineEventId = eventId;
+    pendingOnlineEmployeeId = doc["employee_id"] | "";
+    pendingOnlineEmployeeName = doc["employee_name"] | "";
+    pendingAttendanceRequestBody = doc["payload"] | "";
+    pendingAttendanceAutomatic = doc["automatic"] | false;
+    pendingAttendanceExpectedType = doc["expected_type"] | "";
+    pendingAttendanceApiRejected = doc["api_rejected"] | false;
+    if (!pendingAttendanceRequestBody.isEmpty()) {
+        JsonDocument pendingDoc;
+        if (deserializeJson(pendingDoc, pendingAttendanceRequestBody) ==
+            DeserializationError::Ok) {
+            if (pendingAttendanceExpectedType.isEmpty()) {
+                pendingAttendanceExpectedType =
+                    pendingDoc["row"]["event_type"] | "";
+            }
+            const String action = pendingDoc["action"] | "";
+            if (!action.isEmpty()) {
+                pendingAttendanceAutomatic = (action == "punch");
+            }
+        } else {
+            pendingAttendanceRequestBody = "";
+        }
+    }
+    pendingOnlineEventPersistedOnSd = true;
+    pendingOnlineEventPersistedRejected = pendingAttendanceApiRejected;
+    Serial.printf("Restored pending online event %s from SD\n",
+                  pendingOnlineEventId.c_str());
+    return true;
+}
+
 void setupRcp() {
     digitalWrite(pins::relay, HIGH);
     pinMode(pins::relay, OUTPUT_OPEN_DRAIN);
@@ -5214,22 +5394,28 @@ void setupRcp() {
     preferences.begin("rcp", false);
     networkWorkerReady = initializeNetworkWorker();
     storedPin = preferences.getString("pin", "0000");
-    pendingOnlineEventId = preferences.getString("pending_event", "");
-    pendingOnlineEmployeeId = preferences.getString("pend_emp", "");
-    pendingOnlineEmployeeName = preferences.getString("pending_name", "");
-    pendingAttendanceRequestBody = preferences.getString("pending_payload", "");
-    if (pendingOnlineEventId.isEmpty()) {
+    // One-time cleanup/migration of legacy NVS pending-event keys (now stored in RAM + SD on timeout)
+    const bool hasLegacyNvsPending =
+        preferences.isKey("pending_event") || preferences.isKey("pend_emp") ||
+        preferences.isKey("pending_name") || preferences.isKey("pending_payload");
+    if (hasLegacyNvsPending) {
+        pendingOnlineEventId = preferences.getString("pending_event", "");
+        pendingOnlineEmployeeId = preferences.getString("pend_emp", "");
+        pendingOnlineEmployeeName = preferences.getString("pending_name", "");
+        pendingAttendanceRequestBody = preferences.getString("pending_payload", "");
+        if (!pendingOnlineEventId.isEmpty() && !pendingAttendanceRequestBody.isEmpty()) {
+            JsonDocument pendingDoc;
+            if (deserializeJson(pendingDoc, pendingAttendanceRequestBody) ==
+                DeserializationError::Ok) {
+                const String action = pendingDoc["action"] | "";
+                pendingAttendanceAutomatic = (action == "punch");
+                pendingAttendanceExpectedType = pendingDoc["row"]["event_type"] | "";
+            }
+        }
+        preferences.remove("pending_event");
         preferences.remove("pend_emp");
         preferences.remove("pending_name");
         preferences.remove("pending_payload");
-    } else if (!pendingAttendanceRequestBody.isEmpty()) {
-        JsonDocument pendingDoc;
-        if (deserializeJson(pendingDoc, pendingAttendanceRequestBody) ==
-            DeserializationError::Ok) {
-            const String action = pendingDoc["action"] | "";
-            pendingAttendanceAutomatic = (action == "punch");
-            pendingAttendanceExpectedType = pendingDoc["row"]["event_type"] | "";
-        }
     }
     const bool savedLanguage = preferences.isKey("language");
     const bool savedCamera = preferences.isKey("camera");
@@ -5266,6 +5452,11 @@ void setupRcp() {
         recoverBackupFileIfMissing(kEmployeesPath, "/employees.csv.bak");
         recoverBackupFileIfMissing(kPendingAttendancePath,
                                    "/attendance_pending.csv.bak");
+        if (!pendingOnlineEventId.isEmpty()) {
+            persistPendingOnlineAttendanceToSd();
+        } else {
+            loadPendingOnlineAttendanceFromSd();
+        }
         loadWallpaper();
         const bool employeesFileReady = ensureCsvFile(
             kEmployeesPath,
@@ -5483,6 +5674,7 @@ void expireNetworkRequests() {
         Serial.println("Attendance write result timed out; checking event ID");
         pendingAttendanceRequestId = 0;
         pendingAttendanceRequestStartedAt = 0;
+        persistPendingOnlineAttendanceToSd();
         nextPendingStatusAttemptAt = now;
     }
     if (pendingStatusRequestId != 0 &&

@@ -10,10 +10,13 @@ the other.
 - **Online:** the terminal loads employees through the authenticated Apps Script
   API and sends attendance and diagnostic rows to Google Sheets. Attendance
   writes use a stable `event_id`; Apps Script returns the existing row for
-  duplicate IDs instead of toggling an automatic punch twice. If a request
-  times out, the terminal shows an unknown result, stores the pending event ID
-  in NVS, blocks further punches, and checks `eventStatus` until the result is
-  known. If Wi-Fi is unavailable before an attendance request, the employee
+  duplicate IDs instead of toggling an automatic punch twice. Active online
+  requests are tracked in RAM without touching NVS flash. Only if a request
+  times out or returns an error/unrecognized response does the terminal persist
+  the unresolved event to `/pending_online_event.json` on the SD card, show an
+  unknown result, block further punches, and check `eventStatus` (and retry
+  with the same `event_id` if needed) until the result is known, then delete
+  that SD file. If Wi-Fi is unavailable before an attendance request, the employee
   must explicitly select entry or exit. The event is written to
   `/attendance_pending.csv` on the SD card, not to the offline-mode
   `/attendance.csv`. When connectivity returns, the terminal uploads queued
@@ -226,9 +229,9 @@ entered in the desktop application and saved to the device configuration must
 match. Use **Testuj API** to check API authorization, script execution access,
 sheet IDs, and headers. Keep the Apps Script deployment URL ending in `/exec`.
 
-The firmware verifies TLS against the Google Trust Services Root R1 certificate.
-Only use the supplied Apps Script HTTPS endpoint; arbitrary certificate hosts
-are not configurable.
+The firmware verifies TLS against the bundled Google Trust Services Root CAs
+(`GTS Root R1`, `R2`, `R3`, and `R4`, valid until 2036). Only use the supplied
+Apps Script HTTPS endpoint; arbitrary certificate hosts are not configurable.
 
 Apps Script serializes attendance writes under a script lock and deduplicates
 both `attendance` and automatic `punch` operations by `event_id`. The
